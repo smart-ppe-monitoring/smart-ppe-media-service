@@ -302,6 +302,9 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
             email: payload.email,
             role: payload.role as any,
             roleId: payload.roleId,
+            permissions: Array.isArray((payload as any).permissions)
+              ? (payload as any).permissions
+              : [],
           };
           return next();
         }
@@ -373,6 +376,9 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
         email: payload.email,
         role: payload.role as any,
         roleId: payload.roleId,
+        permissions: Array.isArray((payload as any).permissions)
+          ? (payload as any).permissions
+          : [],
       };
 
       next();
