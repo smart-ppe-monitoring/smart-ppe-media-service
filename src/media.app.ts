@@ -12,6 +12,11 @@ import { rateLimitMiddleware } from "./middlewares/rate-limit.middleware";
 import { requestIdMiddleware } from "./middlewares/request-id.middleware";
 import { maintenanceGuard } from "./middlewares/maintenance.middleware";
 import { envConfig } from "./config/env.config";
+import { buildOpenApiSpec } from "./config/openapi/openapi.registry";
+import { registerFileOpenApi } from "./modules/files/file.openapi";
+
+// Khởi tạo các định nghĩa OpenAPI
+registerFileOpenApi();
 
 /**
  * Express Application cho Media & File Storage Microservice (Phase 6: Second Satellite Service)
@@ -92,6 +97,10 @@ const healthHandler = (_req: express.Request, res: express.Response) => {
 mediaApp.get("/health", healthHandler);
 mediaApp.get("/api/v1/files/health", healthHandler);
 mediaApp.get("/files/health", healthHandler);
+
+// 3.1 OpenAPI Specification Endpoint
+mediaApp.get("/openapi.json", (_req, res) => res.status(200).json(buildOpenApiSpec()));
+mediaApp.get("/api/v1/files/openapi.json", (_req, res) => res.status(200).json(buildOpenApiSpec()));
 
 // 4. Mount File & Media Routes (dual-mount hỗ trợ cả prefix /api/v1/files và /files)
 mediaApp.use(
