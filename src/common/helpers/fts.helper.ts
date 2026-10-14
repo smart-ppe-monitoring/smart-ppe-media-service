@@ -36,7 +36,7 @@ export function buildTsQuery(
   // Tách các từ theo khoảng trắng và dọn dẹp các ký tự nối ở đầu/cuối từ
   const words = sanitized
     .split(" ")
-    .map((w) => w.replace(/^[-.@]+|[-.@]+$/g, "").trim())
+    .map((w) => w.replace(/'/g, "").replace(/^[-.@]+|[-.@]+$/g, "").trim())
     .filter((w) => w.length > 0);
 
   if (words.length === 0) return null;
