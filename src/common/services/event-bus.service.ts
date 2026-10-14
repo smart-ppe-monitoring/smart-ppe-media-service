@@ -1,7 +1,7 @@
 import { Queue, QueueOptions } from "bullmq";
 import IORedis from "ioredis";
 import { uuidv7 } from "uuidv7";
-import { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client-media";
 import { envConfig } from "../../config/env.config";
 import { encryptSecret, decryptSecret } from "../helpers/crypto.helper";
 import {

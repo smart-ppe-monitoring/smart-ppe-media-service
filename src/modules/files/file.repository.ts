@@ -1,4 +1,4 @@
-import { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client-media";
 import { prisma } from "../../database/prisma.client";
 import { FileQueryDto } from "./file.dto";
 import {
@@ -21,12 +21,6 @@ const fileSelect = {
   metadata: true,
   createdAt: true,
   updatedAt: true,
-  user: {
-    select: {
-      id: true,
-      fullName: true,
-    },
-  },
 } satisfies Prisma.FileRecordSelect;
 
 export class FileRepository {
@@ -244,7 +238,6 @@ export class FileRepository {
           metadata: unknown;
           created_at: Date;
           updated_at: Date;
-          user_full_name: string | null;
           rank: number;
         }>
       >`
@@ -252,10 +245,8 @@ export class FileRepository {
           f.id, f.user_id, f.original_name, f.file_name, f.mime_type,
           f.size, f.bucket_key, f.folder, f.is_public, f.is_confirmed,
           f.metadata, f.created_at, f.updated_at,
-          u.full_name as user_full_name,
           ts_rank(to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, '')), to_tsquery('simple', ${tsQuery})) as rank
         FROM file_records f
-        LEFT JOIN users u ON f.user_id = u.id
         ${whereClause}
         ORDER BY rank DESC, f.created_at DESC
         OFFSET ${skip}
@@ -264,7 +255,6 @@ export class FileRepository {
       prisma.$queryRaw<Array<{ count: bigint }>>`
         SELECT COUNT(*)::bigint as count
         FROM file_records f
-        LEFT JOIN users u ON f.user_id = u.id
         ${whereClause}
       `,
     ]);
@@ -284,7 +274,7 @@ export class FileRepository {
       metadata: f.metadata,
       createdAt: f.created_at,
       updatedAt: f.updated_at,
-      user: f.user_id ? { id: f.user_id, fullName: f.user_full_name } : null,
+      user: f.user_id ? { id: f.user_id, fullName: null } : null,
     }));
 
     return {

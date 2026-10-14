@@ -11,6 +11,9 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
+    "prisma:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
     "test": "node --test --test-concurrency=1 --import tsx tests/*.test.ts"
   },
   "dependencies": {

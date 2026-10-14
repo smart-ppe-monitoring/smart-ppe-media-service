@@ -1,6 +1,6 @@
 import path from "node:path";
 import { uuidv7 } from "uuidv7";
-import { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client-media";
 import { FileRepository, fileRepository } from "./file.repository";
 import { R2Service } from "../../common/services/r2.service";
 import { AppError } from "../../common/errors/app-error";

@@ -14,7 +14,7 @@ import { storageCleanupSubscriber } from "./common/subscribers/storage-cleanup.s
 import { eventBus } from "./common/services/event-bus.service";
 import { prisma } from "./database/prisma.client";
 
-const PORT = envConfig.media.port;
+const PORT = envConfig.media.port || envConfig.port || 8890;
 
 /**
  * Media & File Storage Microservice Process (Phase 6: Second Satellite Service)

@@ -1,4 +1,4 @@
-import { Prisma, PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client-media";
 import { prisma } from "../../database/prisma.client";
 import {
   OUTBOX_STATUS,

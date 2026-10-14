@@ -1,0 +1,67 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/@prisma/client-media"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("MEDIA_DATABASE_URL")
+}
+
+model FileRecord {
+  id           String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId       String?   @map("user_id") @db.Uuid
+  originalName String    @map("original_name")
+  fileName     String    @map("file_name")
+  mimeType     String    @map("mime_type")
+  size         Int       @default(0)
+  bucketKey    String    @unique @map("bucket_key")
+  folder       String    @default("general")
+  isPublic     Boolean   @default(false) @map("is_public")
+  isConfirmed  Boolean   @default(false) @map("is_confirmed")
+  metadata     Json?
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([userId, isPublic])
+  @@index([folder, isPublic])
+  @@index([isConfirmed, createdAt])
+  @@index([deletedAt])
+  @@map("file_records")
+}
+
+model AuditLog {
+  id         String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  targetType String   @map("target_type")
+  targetId   String   @map("target_id")
+  details    Json?
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+model OutboxEvent {
+  id          String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  eventType   String    @map("event_type")
+  payload     Json
+  aggregateId String?   @map("aggregate_id")
+  status      String    @default("PENDING") // PENDING, PUBLISHED, FAILED
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+  publishedAt DateTime? @map("published_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@index([status, createdAt])
+  @@index([eventType])
+  @@map("outbox_events")
+}

@@ -7,18 +7,23 @@ const envSchema = z
     NODE_ENV: z
       .enum(["development", "production", "test"])
       .default("development"),
-    PORT: z.coerce.number().int().positive().default(9999),
+    PORT: z.coerce.number().int().positive().default(8890),
 
     // ── Database (Database-per-Service Architecture) ─────────────────────────
-    IDENTITY_DATABASE_URL: z
-      .string()
-      .min(1, "IDENTITY_DATABASE_URL is required"),
+    IDENTITY_DATABASE_URL: z.string().optional(),
     // Các service DB URLs — optional vì không phải service nào cũng active đồng thời
     SITE_DATABASE_URL: z.string().optional(),
     CAMERA_DATABASE_URL: z.string().optional(),
     INCIDENT_DATABASE_URL: z.string().optional(),
     NOTIFICATION_DATABASE_URL: z.string().optional(),
     REPORTING_DATABASE_URL: z.string().optional(),
+    MEDIA_DATABASE_URL: z
+      .string()
+      .min(1, "MEDIA_DATABASE_URL is required")
+      .default(
+        process.env.DATABASE_URL ||
+          "postgresql://ppe_media_user:ppe_media_dev_pass@localhost:5433/ppe_media_db?schema=public",
+      ),
 
     // ── JWT ──────────────────────────────────────────────────────────────────
     JWT_ALGORITHM: z.enum(["RS256", "HS256"]).default("RS256"),
@@ -176,6 +181,7 @@ const envSchema = z
     SECURITY_CONTACT_EMAIL: z.string().default("security@example.com"),
     SECURITY_POLICY_URL: z.string().default(""),
     SECURITY_ACKNOWLEDGMENTS_URL: z.string().default(""),
+
   })
   // ── Production-only Constraints ───────────────────────────────────────────
   .refine(
@@ -369,7 +375,9 @@ export const envConfig = {
   nodeEnv: _env.NODE_ENV,
   port: _env.PORT,
   database: {
-    url: _env.IDENTITY_DATABASE_URL,
+    url: _env.MEDIA_DATABASE_URL,
+    mediaUrl: _env.MEDIA_DATABASE_URL,
+    identityUrl: _env.IDENTITY_DATABASE_URL,
     siteUrl: _env.SITE_DATABASE_URL,
     cameraUrl: _env.CAMERA_DATABASE_URL,
     incidentUrl: _env.INCIDENT_DATABASE_URL,
