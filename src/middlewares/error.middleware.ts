@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client-media";
 import { ZodError } from "zod";
 import multer from "multer";
 import { AppError } from "../common/errors/app-error";
