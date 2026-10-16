@@ -98,9 +98,11 @@ mediaApp.get("/health", healthHandler);
 mediaApp.get("/api/v1/files/health", healthHandler);
 mediaApp.get("/files/health", healthHandler);
 
-// 3.1 OpenAPI Specification Endpoint
-mediaApp.get("/openapi.json", (_req, res) => res.status(200).json(buildOpenApiSpec()));
-mediaApp.get("/api/v1/files/openapi.json", (_req, res) => res.status(200).json(buildOpenApiSpec()));
+// 3.1 OpenAPI Specification Endpoint (Chỉ mở trên dev/staging, ẩn trên production)
+if (envConfig.nodeEnv !== "production") {
+  mediaApp.get("/openapi.json", (_req, res) => res.status(200).json(buildOpenApiSpec()));
+  mediaApp.get("/api/v1/files/openapi.json", (_req, res) => res.status(200).json(buildOpenApiSpec()));
+}
 
 // 4. Mount File & Media Routes (dual-mount hỗ trợ cả prefix /api/v1/files và /files)
 mediaApp.use(

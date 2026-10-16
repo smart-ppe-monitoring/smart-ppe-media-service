@@ -275,42 +275,10 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
 
       const { alg, kid } = decodedComplete.header;
 
-      // 2. Chặn các thuật toán không an toàn hoặc không được phép (chống Algorithm Confusion)
+      // 2. Chặn các thuật toán không an toàn (chỉ chấp nhận RS256 qua JWKS Public Key)
       if (alg !== JWT_ALGORITHM.RS256) {
-        // Cho phép HS256 nếu có cấu hình tương thích ngược
-        if (alg === JWT_ALGORITHM.HS256) {
-          const payload = jwt.verify(token, jwtConfig.accessSecret, {
-            algorithms: [JWT_ALGORITHM.HS256],
-          }) as AccessTokenClaims;
-
-          if (
-            payload.purpose === JWT_PURPOSE.TWO_FACTOR ||
-            payload.type === "TEMP" ||
-            (payload.purpose &&
-              payload.purpose !== JWT_PURPOSE.ACCESS &&
-              (!isStreamPath || payload.purpose !== JWT_PURPOSE.SSE_STREAM_TICKET))
-          ) {
-            throw new AppError(
-              "Token không hợp lệ để truy cập tài nguyên được bảo vệ",
-              401,
-              ERROR_CODE.UNAUTHORIZED,
-            );
-          }
-
-          req.user = {
-            id: payload.id,
-            email: payload.email,
-            role: payload.role as any,
-            roleId: payload.roleId,
-            permissions: Array.isArray((payload as any).permissions)
-              ? (payload as any).permissions
-              : [],
-          };
-          return next();
-        }
-
         throw new AppError(
-          `Thuật toán '${alg}' không được chấp nhận. Yêu cầu RS256.`,
+          `Thuật toán '${alg}' không được chấp nhận. Hệ thống chỉ hỗ trợ RS256.`,
           401,
           ERROR_CODE.TOKEN_INVALID,
         );
