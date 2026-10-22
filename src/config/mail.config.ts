@@ -19,10 +19,10 @@ export const mailConfig = {
   },
   from: envConfig.mail.from,
   get verificationUrl(): string {
-    return `${this.appUrl}/api/v1/auth/verify-email`;
+    return `${this.appUrl}/verify-email`;
   },
   get resetPasswordUrl(): string {
-    return `${this.appUrl}/api/v1/auth/reset-password`;
+    return `${this.appUrl}/reset-password`;
   },
   get resendApiKey(): string {
     return process.env.RESEND_API_KEY || envConfig.mail.resendApiKey;
