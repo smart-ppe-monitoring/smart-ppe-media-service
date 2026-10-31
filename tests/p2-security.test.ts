@@ -1308,6 +1308,128 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-65)", { c
     });
   });
 
+  // ── SEC-55 ───────────────────────────────────────────────────────────────
+  describe("SEC-55: Unconfirmed File Records Permit Metadata and Internal Storage Key Disclosure", () => {
+    test("getFileById rejects unauthenticated request for unconfirmed file with HTTP 400", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unconf-file-1",
+          userId: "owner-user-1",
+          isConfirmed: false,
+          isPublic: true,
+          bucketKey: "internal/keys/unconfirmed-photo.png",
+          fileName: "photo.png",
+        }),
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await assert.rejects(
+        async () => {
+          await service.getFileById("unconf-file-1");
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.BAD_REQUEST);
+          assert.ok(err.message.includes("chưa được xác nhận"));
+          return true;
+        },
+      );
+    });
+
+    test("getFileById rejects non-owner request for unconfirmed file with HTTP 400", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unconf-file-2",
+          userId: "owner-user-1",
+          isConfirmed: false,
+          isPublic: true,
+          bucketKey: "internal/keys/unconfirmed-photo.png",
+          fileName: "photo.png",
+        }),
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await assert.rejects(
+        async () => {
+          await service.getFileById(
+            "unconf-file-2",
+            "attacker-user-999",
+            [],
+            ROLES.USER,
+          );
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.BAD_REQUEST);
+          assert.ok(err.message.includes("chưa được xác nhận"));
+          return true;
+        },
+      );
+    });
+
+    test("getFileById allows file owner to retrieve their own unconfirmed file metadata without public URL", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unconf-file-3",
+          userId: "owner-user-1",
+          isConfirmed: false,
+          isPublic: true,
+          bucketKey: "internal/keys/unconfirmed-photo.png",
+          fileName: "photo.png",
+        }),
+      };
+      const mockR2: any = {
+        getPublicUrl: () => "https://r2/leaked-url",
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+
+      const result = await service.getFileById(
+        "unconf-file-3",
+        "owner-user-1",
+        [],
+        ROLES.OPERATOR,
+      );
+
+      assert.strictEqual(result.id, "unconf-file-3");
+      assert.strictEqual(result.isConfirmed, false);
+      assert.strictEqual(
+        result.url,
+        undefined,
+        "Public URL must NEVER be generated for unconfirmed files",
+      );
+    });
+
+    test("getFileById allows ADMIN to inspect unconfirmed file record", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unconf-file-4",
+          userId: "worker-user-5",
+          isConfirmed: false,
+          isPublic: false,
+          bucketKey: "internal/keys/unconfirmed-inspection.png",
+          fileName: "inspection.png",
+        }),
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      const result = await service.getFileById(
+        "unconf-file-4",
+        "admin-user-1",
+        [],
+        ROLES.ADMIN,
+      );
+
+      assert.strictEqual(result.id, "unconf-file-4");
+      assert.strictEqual(result.isConfirmed, false);
+    });
+  });
+
   // ── SEC-62 ───────────────────────────────────────────────────────────────
   describe("SEC-62: Hardcoded Template Bucket Fallback in File Upload Event Corrupts Downstream Storage Key Resolution", () => {
     test("requestUploadUrl publishes FILE_UPLOADED_UNCONFIRMED with dynamic bucket name and NEVER template-be-bucket", async () => {

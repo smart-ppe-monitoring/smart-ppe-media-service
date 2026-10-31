@@ -371,6 +371,37 @@ export class FileService {
       throw new AppError("Tệp không tồn tại", 404, ERROR_CODE.FILE_NOT_FOUND);
     }
 
+    // SEC-55: Enforce isConfirmed verification and strict ownership check
+    // Unconfirmed files must not expose internal storage keys and metadata to unauthorized callers
+    if (file.isConfirmed === false) {
+      if (!userId) {
+        throw new AppError(
+          "Tệp chưa được xác nhận hoàn tất tải lên",
+          400,
+          ERROR_CODE.BAD_REQUEST,
+        );
+      }
+
+      const userPermissions = await this.resolveEffectivePermissions(
+        userId,
+        permissions,
+        role,
+      );
+      const canManageAll =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
+        userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+      const isOwner = Boolean(file.userId && userId && file.userId === userId);
+
+      if (!isOwner && !canManageAll) {
+        throw new AppError(
+          "Tệp chưa được xác nhận hoàn tất tải lên",
+          400,
+          ERROR_CODE.BAD_REQUEST,
+        );
+      }
+    }
+
     if (!file.isPublic) {
       if (!userId) {
         throw new AppError(
@@ -389,7 +420,7 @@ export class FileService {
         role === ROLES.ADMIN ||
         role === "ADMIN" ||
         userPermissions.includes(PERMISSIONS.FILE_MANAGE);
-      const isOwner = file.userId === userId;
+      const isOwner = Boolean(file.userId && userId && file.userId === userId);
 
       if (!isOwner && !canManageAll) {
         throw new AppError(
@@ -419,9 +450,10 @@ export class FileService {
 
     return {
       ...file,
-      url: file.isPublic
-        ? this.r2Service.getPublicUrl(file.bucketKey)
-        : undefined,
+      url:
+        file.isPublic && file.isConfirmed
+          ? this.r2Service.getPublicUrl(file.bucketKey)
+          : undefined,
     };
   }
 
