@@ -277,27 +277,41 @@ export class FileService {
       );
     }
 
-    // Kiểm tra dung lượng xác nhận với cấu hình hệ thống
-    if (data?.size) {
-      const maxFileSizeMb = 100;
-      const maxSizeBytes = maxFileSizeMb * 1024 * 1024;
-      if (data.size > maxSizeBytes) {
-        throw new AppError(
-          `Dung lượng tệp vượt quá giới hạn cấu hình cho phép (${maxFileSizeMb}MB)`,
-          400,
-          ERROR_CODE.VALIDATION_ERROR,
-        );
-      }
+    // SEC-05: Xác thực sự tồn tại của tệp và lấy dung lượng thực tế từ Object Storage qua HeadObject
+    const headInfo = await this.r2Service.headObject(file.bucketKey);
+    if (!headInfo.exists) {
+      throw new AppError(
+        "Tệp tin chưa được tải lên hệ thống lưu trữ R2/S3",
+        400,
+        ERROR_CODE.NOT_FOUND,
+      );
     }
 
-    const updated = await this.repository.confirmUpload(id, data?.size);
+    const actualSize = headInfo.size;
+    const maxFileSizeMb = 100;
+    const maxSizeBytes = maxFileSizeMb * 1024 * 1024;
+    if (actualSize > maxSizeBytes) {
+      throw new AppError(
+        `Dung lượng tệp thực tế (${Math.round(actualSize / 1024 / 1024)}MB) vượt quá giới hạn cấu hình cho phép (${maxFileSizeMb}MB)`,
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
+    }
+
+    // Sử dụng kích thước thực tế từ HeadObject thay vì tin cậy dữ liệu client gửi lên
+    const finalSize = actualSize > 0 ? actualSize : (data?.size ?? file.size);
+    const updated = await this.repository.confirmUpload(id, finalSize);
 
     await this.repository.createAuditLog({
       actorId: userId,
       action: AUDIT_ACTION.CONFIRM_FILE_UPLOAD,
       targetType: AUDIT_TARGET_TYPE.FILE,
       targetId: id,
-      details: { bucketKey: file.bucketKey, size: data.size },
+      details: {
+        bucketKey: file.bucketKey,
+        size: finalSize,
+        reportedSize: data?.size,
+      },
       ipAddress: metadata?.ipAddress,
       userAgent: metadata?.userAgent,
     });

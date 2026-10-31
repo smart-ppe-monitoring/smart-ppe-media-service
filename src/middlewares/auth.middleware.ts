@@ -97,6 +97,18 @@ export async function authMiddleware(
       return;
     }
 
+    // SEC-07: Chặn token mang cờ mustChangePassword truy cập tài nguyên
+    if (payload.mustChangePassword === true) {
+      next(
+        new AppError(
+          "Yêu cầu đổi mật khẩu trước khi truy cập tài nguyên hệ thống",
+          403,
+          ERROR_CODE.FORBIDDEN,
+        ),
+      );
+      return;
+    }
+
     req.user = {
       id: payload.id || payload.sub,
       email: payload.email,

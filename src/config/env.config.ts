@@ -315,9 +315,15 @@ if (!_parsed.success) {
 
 const _env = _parsed.data;
 
-/** Phân giải giá trị TRUST_PROXY sang kiểu mà Express chấp nhận */
-function parseTrustProxy(val: string): boolean | number | string | string[] {
-  if (val === "true") return true;
+/**
+ * Phân giải giá trị TRUST_PROXY sang kiểu mà Express chấp nhận (SEC-08).
+ * Khi TRUST_PROXY="true", chỉ tin cậy 1 hop proxy (Traefik Ingress Gateway) thay vì true (unlimited hops)
+ * để ngăn chặn kẻ tấn công tự tiêm IP giả mạo vào header X-Forwarded-For nhằm bypass rate limiting.
+ */
+export function parseTrustProxy(
+  val: string,
+): boolean | number | string | string[] {
+  if (val === "true") return 1;
   if (val === "false") return false;
   if (/^\d+$/.test(val)) return parseInt(val, 10);
   if (val.includes(",")) return val.split(",").map((s) => s.trim());

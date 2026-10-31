@@ -4,6 +4,7 @@ import {
   DeleteObjectsCommand,
   PutObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   ListObjectsV2CommandOutput,
 } from "@aws-sdk/client-s3";
@@ -214,5 +215,36 @@ export class R2Service {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     return Buffer.concat(chunks);
+  }
+
+  /**
+   * Lấy metadata đối tượng từ R2/S3 để xác thực sự tồn tại, dung lượng thực tế và content-type (SEC-05).
+   * @param key Đường dẫn file trong bucket
+   */
+  async headObject(
+    key: string,
+  ): Promise<{ size: number; contentType?: string; exists: boolean }> {
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+      });
+      const response = await this.client.send(command);
+      return {
+        size: response.ContentLength ?? 0,
+        contentType: response.ContentType,
+        exists: true,
+      };
+    } catch (err: any) {
+      if (
+        err.name === "NotFound" ||
+        err.$metadata?.httpStatusCode === 404 ||
+        err.message?.includes("404") ||
+        err.Code === "NoSuchKey"
+      ) {
+        return { size: 0, exists: false };
+      }
+      throw err;
+    }
   }
 }

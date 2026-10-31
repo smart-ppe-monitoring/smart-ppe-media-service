@@ -98,6 +98,7 @@ interface AccessTokenClaims {
   roleId?: string;
   purpose?: string;
   type?: string;
+  mustChangePassword?: boolean;
 }
 
 /**
@@ -419,6 +420,15 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
           "Token không hợp lệ để truy cập tài nguyên được bảo vệ",
           401,
           ERROR_CODE.UNAUTHORIZED,
+        );
+      }
+
+      // SEC-07: Chặn token mang cờ mustChangePassword truy cập tài nguyên
+      if (payload.mustChangePassword === true) {
+        throw new AppError(
+          "Yêu cầu đổi mật khẩu trước khi truy cập tài nguyên hệ thống",
+          403,
+          ERROR_CODE.FORBIDDEN,
         );
       }
 
