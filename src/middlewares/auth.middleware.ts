@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { jwtConfig } from "../config/jwt.config";
+import { jwtKeyService } from "../common/services/jwt-key.service";
 import { AppError } from "../common/errors/app-error";
 import { ERROR_CODE } from "../common/errors/error-code";
 import { JWT_PURPOSE, JWT_ALGORITHM } from "../common/constants/jwt.constant";
@@ -59,13 +60,40 @@ export async function authMiddleware(
   }
 
   try {
-    const secret = jwtConfig.publicKey || jwtConfig.accessSecret;
-    const payload = jwt.verify(token, secret, {
-      algorithms: [JWT_ALGORITHM.RS256, JWT_ALGORITHM.HS256],
+    const publicKey = jwtKeyService.getPublicKeyPem() || jwtConfig.publicKey;
+    if (!publicKey) {
+      next(
+        new AppError(
+          "Chưa cấu hình khóa công khai JWT",
+          500,
+          ERROR_CODE.INTERNAL_SERVER_ERROR,
+        ),
+      );
+      return;
+    }
+
+    const payload = jwt.verify(token, publicKey, {
+      algorithms: [JWT_ALGORITHM.RS256],
     }) as any;
 
     if (!payload || typeof payload !== "object") {
       next(new AppError("Token không hợp lệ", 401, ERROR_CODE.UNAUTHORIZED));
+      return;
+    }
+
+    // 5. Kiểm tra mục đích token (bảo vệ chống token tạm thời / 2FA)
+    if (
+      payload.purpose === JWT_PURPOSE.TWO_FACTOR ||
+      payload.type === "TEMP" ||
+      (payload.purpose && payload.purpose !== JWT_PURPOSE.ACCESS)
+    ) {
+      next(
+        new AppError(
+          "Token không hợp lệ để truy cập tài nguyên được bảo vệ",
+          401,
+          ERROR_CODE.UNAUTHORIZED,
+        ),
+      );
       return;
     }
 
@@ -79,6 +107,10 @@ export async function authMiddleware(
 
     next();
   } catch (error) {
+    if (error instanceof AppError) {
+      next(error);
+      return;
+    }
     next(new AppError("Token xác thực không hợp lệ hoặc đã hết hạn", 401, ERROR_CODE.UNAUTHORIZED));
   }
 }

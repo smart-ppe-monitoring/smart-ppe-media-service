@@ -197,10 +197,19 @@ export class FileController {
       if ("buffer" in result && Buffer.isBuffer(result.buffer)) {
         res.setHeader("Content-Type", result.info.mimeType);
         res.setHeader("Content-Length", result.info.size);
-        res.setHeader(
-          "Cache-Control",
-          "public, max-age=86400, stale-while-revalidate=3600",
-        );
+        if (result.isPublic) {
+          res.setHeader(
+            "Cache-Control",
+            "public, max-age=86400, stale-while-revalidate=3600",
+          );
+        } else {
+          res.setHeader(
+            "Cache-Control",
+            "private, no-cache, no-store, must-revalidate",
+          );
+          res.setHeader("Pragma", "no-cache");
+          res.setHeader("Expires", "0");
+        }
         return res.send(result.buffer);
       }
 

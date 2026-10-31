@@ -91,7 +91,7 @@ export function requirePermission(...permissions: string[]) {
 
       const userPermissions = resolveSatellitePermissions(req);
 
-      if (req.user.role === ROLES.ADMIN || req.user.role === "ADMIN") {
+      if (!req.apiKey && (req.user.role === ROLES.ADMIN || req.user.role === "ADMIN")) {
         return next();
       }
 
@@ -122,7 +122,7 @@ export function requireAnyPermission(...permissions: string[]) {
 
       const userPermissions = resolveSatellitePermissions(req);
 
-      if (req.user.role === ROLES.ADMIN || req.user.role === "ADMIN") {
+      if (!req.apiKey && (req.user.role === ROLES.ADMIN || req.user.role === "ADMIN")) {
         return next();
       }
 

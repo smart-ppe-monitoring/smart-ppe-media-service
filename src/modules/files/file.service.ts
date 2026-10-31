@@ -605,6 +605,7 @@ export class FileService {
           size: number;
           mimeType: string;
         };
+        isPublic?: boolean;
       }
     | FileResponseDto
   > {
@@ -727,7 +728,10 @@ export class FileService {
       };
     }
 
-    return processed;
+    return {
+      ...processed,
+      isPublic: file.isPublic,
+    };
   }
 
   /**
