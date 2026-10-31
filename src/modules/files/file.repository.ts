@@ -449,6 +449,25 @@ export class FileRepository {
       where: { id: { in: ids } },
     });
   }
+
+  /**
+   * SEC-63: Tìm danh sách tệp thuộc người dùng phục vụ xóa dữ liệu theo GDPR Article 17
+   */
+  findByUserId(userId: string) {
+    return prisma.fileRecord.findMany({
+      where: { userId },
+      select: { id: true, bucketKey: true },
+    });
+  }
+
+  /**
+   * SEC-63: Xóa vĩnh viễn toàn bộ bản ghi tệp của người dùng theo GDPR Article 17
+   */
+  deleteByUserId(userId: string) {
+    return prisma.fileRecord.deleteMany({
+      where: { userId },
+    });
+  }
 }
 
 export const fileRepository = new FileRepository();

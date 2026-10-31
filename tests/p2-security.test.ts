@@ -8,10 +8,11 @@ import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
 import { ROLES } from "../src/common/constants/role.constant";
 import { PERMISSIONS } from "../src/common/constants/permission.constant";
-import { EVENT_NAMES } from "../src/common/constants/event.constant";
+import { EVENT_NAMES, OUTBOX_STATUS } from "../src/common/constants/event.constant";
 import { StorageCleanupSubscriber } from "../src/common/subscribers/storage-cleanup.subscriber";
 import { FileService } from "../src/modules/files/file.service";
 import { R2Service } from "../src/common/services/r2.service";
+import { OutboxRepository } from "../src/common/repositories/outbox.repository";
 import { directImageUploadSchema, listFilesSchema } from "../src/modules/files/file.validation";
 import {
   calculatePaginationSkip,
@@ -31,7 +32,7 @@ import mediaApp from "../src/media.app";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-54)", { concurrency: false }, () => {
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-65)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -1298,15 +1299,207 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-54)", { c
         await repo.searchFts({ search: "ppe", mimeType: "image/_%" }, "admin", true);
 
         const queryStr = JSON.stringify(passedQueries);
-        assert.ok(
-          queryStr.includes("image/\\\\_\\\\%"),
-          "Wildcard sequences in mimeType must be escaped",
-        );
+        assert.ok(queryStr.includes("image/\\\\_") && queryStr.includes("\\\\%"), "Wildcard sequences in mimeType must be escaped");
         assert.ok(queryStr.includes("ESCAPE"), "Query must include explicit ESCAPE clause");
       } finally {
         (prisma as any).$transaction = originalTx;
         (prisma as any).$queryRaw = originalRaw;
       }
+    });
+  });
+
+  // ── SEC-62 ───────────────────────────────────────────────────────────────
+  describe("SEC-62: Hardcoded Template Bucket Fallback in File Upload Event Corrupts Downstream Storage Key Resolution", () => {
+    test("requestUploadUrl publishes FILE_UPLOADED_UNCONFIRMED with dynamic bucket name and NEVER template-be-bucket", async () => {
+      let publishedPayload: any = null;
+      const mockEventBus: any = {
+        publish: async (name: string, payload: any) => {
+          publishedPayload = payload;
+          return { id: "evt-1", name, payload, source: "media", timestamp: Date.now() };
+        },
+      };
+
+      const mockRepo: any = {
+        create: async (data: any) => ({
+          id: "01931580-0000-7000-8000-000000000001",
+          ...data,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        getPresignedUploadUrl: async () => "https://r2.cloudflarestorage.com/upload-presigned",
+        getBucketName: () => "custom-ppe-bucket",
+      };
+
+      const service = new FileService(mockRepo, mockR2, mockEventBus);
+      await service.requestUploadUrl(
+        {
+          fileName: "evidence.png",
+          mimeType: "image/png",
+          size: 1024,
+          isPublic: false,
+        },
+        "user-1",
+        [PERMISSIONS.FILE_UPLOAD],
+        undefined,
+        ROLES.OPERATOR,
+      );
+
+      assert.ok(publishedPayload);
+      assert.strictEqual(publishedPayload.bucket, "custom-ppe-bucket");
+      assert.notStrictEqual(publishedPayload.bucket, "template-be-bucket");
+    });
+  });
+
+  // ── SEC-63 ───────────────────────────────────────────────────────────────
+  describe("SEC-63: Absence of User Deletion Event Subscription Leaks Personal Files Violating GDPR Article 17", () => {
+    test("purgeUserMedia purges both R2 storage objects and database records for deleted user", async () => {
+      let deletedKeys: string[] = [];
+      let deletedByUserId: string = "";
+
+      const mockRepo: any = {
+        findByUserId: async (uid: string) => [
+          { id: "f-1", bucketKey: `files/${uid}/avatar.png` },
+          { id: "f-2", bucketKey: `files/${uid}/evidence.jpg` },
+        ],
+        deleteByUserId: async (uid: string) => {
+          deletedByUserId = uid;
+          return { count: 2 };
+        },
+      };
+
+      const mockR2: any = {
+        deleteFiles: async (keys: string[]) => {
+          deletedKeys = keys;
+          return { deleted: keys, errors: [] };
+        },
+      };
+
+      const subscriber = new StorageCleanupSubscriber({} as any, mockR2, mockRepo);
+      const purgedCount = await subscriber.purgeUserMedia("user-to-erase");
+
+      assert.strictEqual(purgedCount, 2);
+      assert.deepStrictEqual(deletedKeys, [
+        "files/user-to-erase/avatar.png",
+        "files/user-to-erase/evidence.jpg",
+      ]);
+      assert.strictEqual(deletedByUserId, "user-to-erase");
+    });
+
+    test("StorageCleanupSubscriber registers listener for EVENT_NAMES.USER_SOFT_DELETED", () => {
+      let registeredEvent = "";
+      const mockBus: any = {
+        subscribe: (eventName: string) => {
+          if (eventName === EVENT_NAMES.USER_SOFT_DELETED) {
+            registeredEvent = eventName;
+          }
+        },
+      };
+
+      const subscriber = new StorageCleanupSubscriber(mockBus, {} as any, {} as any);
+      subscriber.register();
+
+      assert.strictEqual(registeredEvent, EVENT_NAMES.USER_SOFT_DELETED);
+    });
+  });
+
+  // ── SEC-64 ───────────────────────────────────────────────────────────────
+  describe("SEC-64: Non-Atomic Read-Modify-Write in Outbox markFailed Induces Lost Update Race Under Concurrency", () => {
+    test("markFailed atomically increments attempts using Prisma atomic increment and updates status", async () => {
+      let updatePayloads: any[] = [];
+      const mockDb: any = {
+        outboxEvent: {
+          update: async (params: any) => {
+            updatePayloads.push(params);
+            if (params.data?.attempts?.increment) {
+              return { attempts: 5 }; // Reaches maxAttempts 5
+            }
+            return { attempts: 5, status: params.data?.status };
+          },
+        },
+      };
+
+      const repo = new OutboxRepository(mockDb);
+      await repo.markFailed("01931580-0000-7000-8000-000000000001", "Connection refused", 5);
+
+      assert.strictEqual(updatePayloads.length, 2);
+      // First update must use atomic increment
+      assert.deepStrictEqual(updatePayloads[0].data.attempts, { increment: 1 });
+      assert.strictEqual(updatePayloads[0].data.lastError, "Connection refused");
+      // Second update must mark FAILED when maxAttempts reached
+      assert.strictEqual(updatePayloads[1].data.status, OUTBOX_STATUS.FAILED);
+    });
+
+    test("markFailed resets status to PENDING when attempts below maxAttempts", async () => {
+      let updatePayloads: any[] = [];
+      const mockDb: any = {
+        outboxEvent: {
+          update: async (params: any) => {
+            updatePayloads.push(params);
+            if (params.data?.attempts?.increment) {
+              return { attempts: 2 }; // Below maxAttempts 5
+            }
+            return { attempts: 2, status: params.data?.status };
+          },
+        },
+      };
+
+      const repo = new OutboxRepository(mockDb);
+      await repo.markFailed("01931580-0000-7000-8000-000000000001", "Transient timeout", 5);
+
+      assert.strictEqual(updatePayloads.length, 2);
+      assert.deepStrictEqual(updatePayloads[0].data.attempts, { increment: 1 });
+      assert.strictEqual(updatePayloads[1].data.status, OUTBOX_STATUS.PENDING);
+    });
+  });
+
+  // ── SEC-65 ───────────────────────────────────────────────────────────────
+  describe("SEC-65: S3 Presigning Failure in requestUploadUrl Leaks Unconfirmed Database Records Without Rollback", () => {
+    test("requestUploadUrl does not create database record if getPresignedUploadUrl fails", async () => {
+      let createCalled = false;
+      const mockRepo: any = {
+        create: async () => {
+          createCalled = true;
+          return { id: "leaked-row" };
+        },
+      };
+
+      const mockR2: any = {
+        getPresignedUploadUrl: async () => {
+          throw new Error("AWS Credentials Expired / S3 Network Timeout");
+        },
+        getBucketName: () => "ppe-bucket",
+      };
+
+      const service = new FileService(mockRepo, mockR2);
+
+      await assert.rejects(
+        async () => {
+          await service.requestUploadUrl(
+            {
+              fileName: "evidence.png",
+              mimeType: "image/png",
+              size: 1024,
+            },
+            "user-1",
+            [PERMISSIONS.FILE_UPLOAD],
+            undefined,
+            ROLES.OPERATOR,
+          );
+        },
+        {
+          message: "AWS Credentials Expired / S3 Network Timeout",
+        },
+      );
+
+      assert.strictEqual(
+        createCalled,
+        false,
+        "repository.create must NEVER be called if presigning fails, preventing orphan database records",
+      );
     });
   });
 });

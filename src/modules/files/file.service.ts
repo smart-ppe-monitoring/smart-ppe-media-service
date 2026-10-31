@@ -17,6 +17,7 @@ import {
   DEFAULT_ALLOWED_MIME_TYPES,
 } from "../../common/constants/system-config.constant";
 import { r2Config } from "../../config/r2.config";
+import { envConfig } from "../../config/env.config";
 import {
   RequestUploadUrlDto,
   UploadUrlResponseDto,
@@ -198,6 +199,13 @@ export class FileService {
     const folder = data.folder || "general";
     const bucketKey = `${folder}/${userId || "anonymous"}/${uuidv7()}_${sanitizedName}`;
 
+    // SEC-65: Generate S3 presigned URL before inserting database record to prevent orphan DB row leaks if S3 fails
+    const uploadUrl = await this.r2Service.getPresignedUploadUrl(
+      bucketKey,
+      data.mimeType,
+      expiresIn,
+    );
+
     const fileRecord = await this.repository.create({
       userId,
       originalName: data.fileName,
@@ -210,22 +218,26 @@ export class FileService {
       metadata: (data.metadata ?? Prisma.JsonNull) as Prisma.InputJsonValue,
     });
 
-    const uploadUrl = await this.r2Service.getPresignedUploadUrl(
-      bucketKey,
-      data.mimeType,
-      expiresIn,
-    );
-
     // Event-Driven Backbone: Publish file.uploaded_unconfirmed event
     const uploadExpiresAt = new Date(
       Date.now() + expiresIn * 1000,
     ).toISOString();
     if (typeof this.eventBus?.publish === "function") {
+      // SEC-62: Resolve bucket dynamically from r2Service or config without hardcoded template-be-bucket fallback
+      const targetBucket =
+        (typeof this.r2Service.getBucketName === "function"
+          ? this.r2Service.getBucketName()
+          : undefined) ||
+        r2Config.bucketName ||
+        envConfig.s3?.bucket ||
+        envConfig.minio?.bucketEvidences ||
+        "smart-ppe-evidence";
+
       await this.eventBus
         .publish(EVENT_NAMES.FILE_UPLOADED_UNCONFIRMED, {
           fileId: fileRecord.id,
           key: bucketKey,
-          bucket: r2Config.bucketName || "template-be-bucket",
+          bucket: targetBucket,
           expiresAt: uploadExpiresAt,
         })
         .catch((err) => {

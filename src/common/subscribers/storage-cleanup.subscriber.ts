@@ -2,6 +2,7 @@ import { eventBus, EventBusService } from "../services/event-bus.service";
 import { EVENT_NAMES } from "../constants/event.constant";
 import {
   FileUploadedUnconfirmedPayload,
+  UserSoftDeletedPayload,
   EventEnvelope,
 } from "../types/event.type";
 import { R2Service, r2Service as defaultR2Service } from "../services/r2.service";
@@ -68,6 +69,50 @@ export class StorageCleanupSubscriber {
         }
       },
     );
+
+    // SEC-63: Subscribe to user.soft_deleted for GDPR Article 17 Right to Erasure compliance
+    this.bus.subscribe(
+      EVENT_NAMES.USER_SOFT_DELETED,
+      async (envelope: EventEnvelope<UserSoftDeletedPayload>) => {
+        const { userId } = envelope.payload;
+        if (userId) {
+          await this.purgeUserMedia(userId);
+        }
+      },
+    );
+  }
+
+  /**
+   * SEC-63: GDPR Article 17 Right to Erasure
+   * Xóa toàn bộ file và blob R2 khi nhận sự kiện user.soft_deleted
+   */
+  public async purgeUserMedia(userId: string): Promise<number> {
+    try {
+      const files = await this.fileRepository.findByUserId(userId);
+      if (!files || files.length === 0) return 0;
+
+      const keys = files.map((f: { id: string; bucketKey: string }) => f.bucketKey).filter(Boolean);
+      if (keys.length > 0 && typeof this.r2Service.deleteFiles === "function") {
+        await this.r2Service.deleteFiles(keys).catch((err: any) => {
+          console.warn(
+            `[StorageCleanupSubscriber] Failed to purge R2 files for deleted user ${userId}:`,
+            err?.message || err,
+          );
+        });
+      }
+
+      await this.fileRepository.deleteByUserId(userId);
+      console.log(
+        `[StorageCleanupSubscriber] 🗑️ Purged ${files.length} media files for deleted user ${userId}`,
+      );
+      return files.length;
+    } catch (err: any) {
+      console.error(
+        `[StorageCleanupSubscriber] Failed to purge media for user ${userId}:`,
+        err?.message || err,
+      );
+      return 0;
+    }
   }
 
   /**
