@@ -52,9 +52,14 @@ import {
   maskSensitiveCredentials,
   sanitizeErrorForLogging,
 } from "../src/middlewares/error.middleware";
-import { eventBus, SENSITIVE_OUTBOX_FIELDS } from "../src/common/services/event-bus.service";
+import {
+  eventBus,
+  EventBusService,
+  SENSITIVE_OUTBOX_FIELDS,
+} from "../src/common/services/event-bus.service";
+import { OutboxRepository } from "../src/common/repositories/outbox.repository";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-50)", { concurrency: false }, () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-58)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -1616,6 +1621,270 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-50)", { c
       } finally {
         (eventBus as any).setRedisConnectionForTesting(originalRedis, originalAvailable);
         await eventBus.clearProcessedCache();
+      }
+    });
+  });
+
+  describe("SEC-56: In-Memory Event Backoff Retry Decoupling Prevents Head-of-Line Blocking DoS", () => {
+    test("failed event retry backoff does not block immediate execution of subsequent events", async () => {
+      const bus = new EventBusService();
+      let event2ProcessedTime = 0;
+      const startTime = Date.now();
+      let event1Attempts = 0;
+
+      const unsub1 = bus.subscribe(EVENT_NAMES.FILE_UPLOADED, async () => {
+        event1Attempts++;
+        if (event1Attempts === 1) {
+          throw new Error("Simulated transient failure for event 1");
+        }
+      });
+
+      const unsub2 = bus.subscribe(EVENT_NAMES.FILE_DELETED, async () => {
+        event2ProcessedTime = Date.now();
+      });
+
+      try {
+        // Enqueue event 1 (fails on first attempt, will backoff)
+        (bus as any).inMemoryQueue.push({
+          id: "evt-hol-1",
+          envelope: {
+            id: "evt-hol-1",
+            name: EVENT_NAMES.FILE_UPLOADED,
+            timestamp: Date.now(),
+            source: "test",
+            payload: {},
+          },
+          attempts: 0,
+        });
+
+        // Enqueue event 2 (healthy event queued behind event 1)
+        (bus as any).inMemoryQueue.push({
+          id: "evt-hol-2",
+          envelope: {
+            id: "evt-hol-2",
+            name: EVENT_NAMES.FILE_DELETED,
+            timestamp: Date.now(),
+            source: "test",
+            payload: {},
+          },
+          attempts: 0,
+        });
+
+        (bus as any).triggerInMemoryProcessing();
+
+        // Wait a short time (<80ms) for event 2 to execute without being blocked by event 1 backoff (min 100ms)
+        await new Promise((r) => setTimeout(r, 60));
+
+        assert.ok(event2ProcessedTime > 0, "Event 2 must be executed immediately without waiting for Event 1 retry backoff");
+        const elapsed = event2ProcessedTime - startTime;
+        assert.ok(elapsed < 150, `Event 2 should execute quickly, actual: ${elapsed}ms`);
+      } finally {
+        unsub1();
+        unsub2();
+        await bus.close();
+      }
+    });
+
+    test("event exceeding max attempts is moved to DLQ and marked failed", async () => {
+      let markFailedCalled = false;
+      let failedAttempts = 0;
+      const mockOutboxRepo: any = {
+        markPublished: async () => {},
+        markFailed: async (id: string, err: string, attempts: number) => {
+          markFailedCalled = true;
+          failedAttempts = attempts;
+        },
+      };
+
+      const bus = new EventBusService(mockOutboxRepo);
+      const unsub = bus.subscribe(EVENT_NAMES.FILE_UPLOADED, async () => {
+        throw new Error("Permanent failure");
+      });
+
+      try {
+        (bus as any).inMemoryQueue.push({
+          id: "evt-dlq-1",
+          envelope: {
+            id: "evt-dlq-1",
+            name: EVENT_NAMES.FILE_UPLOADED,
+            timestamp: Date.now(),
+            source: "test",
+            payload: {},
+          },
+          attempts: 4, // Next failure will reach 5 (DEFAULT_MAX_ATTEMPTS)
+        });
+
+        (bus as any).triggerInMemoryProcessing();
+        await new Promise((r) => setTimeout(r, 50));
+
+        assert.strictEqual(markFailedCalled, true, "markFailed must be called when max attempts exceeded");
+        assert.strictEqual(failedAttempts, 5);
+      } finally {
+        unsub();
+        await bus.close();
+      }
+    });
+  });
+
+  describe("SEC-57: Outbox Polling Composite Index on [status, updatedAt] Prevents Table Scans", () => {
+    test("prisma/schema.prisma includes @@index([status, updatedAt]) for OutboxEvent", () => {
+      const schemaPath = path.resolve(__dirname, "../prisma/schema.prisma");
+      const schemaContent = fs.readFileSync(schemaPath, "utf-8");
+
+      assert.ok(
+        schemaContent.includes("@@index([status, updatedAt])"),
+        "OutboxEvent model in prisma/schema.prisma must declare @@index([status, updatedAt])",
+      );
+    });
+
+    test("Outbox migration contains CREATE INDEX for status and updated_at", () => {
+      const migrationDir = path.resolve(
+        __dirname,
+        "../prisma/migrations/20261014180000_add_outbox_events_status_updated_at_index/migration.sql",
+      );
+      assert.ok(fs.existsSync(migrationDir), "Migration SQL file for SEC-57 must exist");
+      const migrationSql = fs.readFileSync(migrationDir, "utf-8");
+      assert.ok(
+        migrationSql.includes('CREATE INDEX IF NOT EXISTS "outbox_events_status_updated_at_idx"') &&
+        migrationSql.includes('"outbox_events"("status", "updated_at")'),
+        "Migration SQL must create index on outbox_events(status, updated_at)",
+      );
+    });
+
+    test("OutboxRepository.claimPendingEvents polls with status and updated_at filter", async () => {
+      let executedQuery = "";
+      const mockDb: any = {
+        $queryRaw: async (queryStrings: any, ...values: any[]) => {
+          executedQuery = Array.isArray(queryStrings) ? queryStrings.join("?") : String(queryStrings);
+          return [];
+        },
+      };
+
+      const repo = new OutboxRepository(mockDb);
+      await repo.claimPendingEvents(25);
+
+      assert.ok(executedQuery.includes("updated_at < NOW() - INTERVAL '5 minutes'"), "claimPendingEvents must poll stalled events using updated_at");
+      assert.ok(executedQuery.includes("status ="), "claimPendingEvents must check status");
+    });
+  });
+
+  describe("SEC-58: Outbox Event Status Preservation Prevents Event Loss on Crash", () => {
+    test("publish with in-memory fallback leaves outbox record PENDING until subscriber succeeds", async () => {
+      let markPublishedCalled = false;
+      const createdEvents: any[] = [];
+
+      const mockOutboxRepo: any = {
+        create: async (data: any) => {
+          const record = {
+            id: "outbox-rec-123",
+            eventType: data.eventType,
+            payload: data.payload,
+            aggregateId: data.aggregateId ?? null,
+            status: "PENDING",
+            attempts: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          createdEvents.push(record);
+          return record;
+        },
+        markPublished: async (id: string) => {
+          markPublishedCalled = true;
+          const found = createdEvents.find((e) => e.id === id);
+          if (found) found.status = "PUBLISHED";
+        },
+      };
+
+      const bus = new EventBusService(mockOutboxRepo);
+      (bus as any).setRedisConnectionForTesting(undefined, false);
+
+      let subscriberFinished = false;
+      let statusWhenPublishedReturned = "";
+
+      const unsub = bus.subscribe(EVENT_NAMES.FILE_CREATED, async () => {
+        subscriberFinished = true;
+      });
+
+      try {
+        await bus.publish(EVENT_NAMES.FILE_CREATED, {
+          fileId: "f-123",
+          userId: "u-456",
+          originalName: "photo.jpg",
+          mimeType: "image/jpeg",
+          size: 100,
+          bucketKey: "keys/photo.jpg",
+          isPublic: false,
+        } as any);
+
+        // Right when publish returns, markPublished must NOT have executed synchronously!
+        statusWhenPublishedReturned = createdEvents[0]?.status;
+        assert.strictEqual(
+          statusWhenPublishedReturned,
+          "PENDING",
+          "Outbox event status must still be PENDING when publish() returns in in-memory mode",
+        );
+
+        // Wait for setImmediate in-memory queue to process
+        await new Promise((r) => setTimeout(r, 60));
+
+        assert.strictEqual(subscriberFinished, true, "Subscriber should have finished");
+        assert.strictEqual(markPublishedCalled, true, "markPublished should be called AFTER subscriber finishes");
+        assert.strictEqual(createdEvents[0]?.status, "PUBLISHED");
+      } finally {
+        unsub();
+        await bus.close();
+      }
+    });
+
+    test("if in-memory processing fails, outbox event is NOT marked PUBLISHED", async () => {
+      let markPublishedCalled = false;
+      const createdEvents: any[] = [];
+
+      const mockOutboxRepo: any = {
+        create: async (data: any) => {
+          const record = {
+            id: "outbox-fail-456",
+            eventType: data.eventType,
+            payload: data.payload,
+            status: "PENDING",
+            attempts: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          createdEvents.push(record);
+          return record;
+        },
+        markPublished: async () => {
+          markPublishedCalled = true;
+        },
+        markFailed: async () => {},
+      };
+
+      const bus = new EventBusService(mockOutboxRepo);
+      (bus as any).setRedisConnectionForTesting(undefined, false);
+
+      const unsub = bus.subscribe(EVENT_NAMES.FILE_CREATED, async () => {
+        throw new Error("Subscriber crash / failure");
+      });
+
+      try {
+        await bus.publish(EVENT_NAMES.FILE_CREATED, {
+          fileId: "f-failed",
+          userId: "u-1",
+          originalName: "fail.jpg",
+          mimeType: "image/jpeg",
+          size: 50,
+          bucketKey: "keys/fail.jpg",
+          isPublic: false,
+        } as any);
+
+        await new Promise((r) => setTimeout(r, 60));
+
+        assert.strictEqual(markPublishedCalled, false, "markPublished must NEVER be called if subscriber execution fails");
+        assert.strictEqual(createdEvents[0]?.status, "PENDING", "Outbox event must remain PENDING for relay recovery");
+      } finally {
+        unsub();
+        await bus.close();
       }
     });
   });

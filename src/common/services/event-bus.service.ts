@@ -84,6 +84,7 @@ export class EventBusService {
     envelope: EventEnvelope;
     attempts: number;
   }> = [];
+  private activeRetryTimers = new Set<NodeJS.Timeout>();
   private outboxRepo: OutboxRepository;
   private isProcessingInMemory = false;
 
@@ -234,9 +235,13 @@ export class EventBusService {
           return envelope;
         }
 
-        // Nếu không nằm trong transaction mở, tiếp tục dispatch và mark published ngay
-        await this.enqueueEnvelope(envelope);
-        await this.outboxRepo.markPublished(outboxRecord.id).catch(() => {});
+        // SEC-58: Khi enqueue vào queue broker ngoại vi (BullMQ/Redis), bản ghi có thể đánh dấu PUBLISHED.
+        // Tuy nhiên, khi rơi vào fallback in-memory queue cục bộ, KHÔNG đánh dấu published ngay tại đây
+        // mà chờ subscriber thực thi xong trong triggerInMemoryProcessing() để chống mất event khi process crash.
+        const destination = await this.enqueueEnvelope(envelope);
+        if (destination === "queue") {
+          await this.outboxRepo.markPublished(outboxRecord.id).catch(() => {});
+        }
         return envelope;
       } catch (err: any) {
         if (options?.tx) {
@@ -257,7 +262,9 @@ export class EventBusService {
   /**
    * Đẩy envelope vào hàng đợi BullMQ hoặc in-memory
    */
-  private async enqueueEnvelope(envelope: EventEnvelope): Promise<void> {
+  private async enqueueEnvelope(
+    envelope: EventEnvelope,
+  ): Promise<"queue" | "in_memory"> {
     if (this.isRedisAvailable) {
       try {
         if (
@@ -268,14 +275,14 @@ export class EventBusService {
           await this.notificationQueue.add(envelope.name, envelope, {
             jobId: envelope.id,
           });
-          return;
+          return "queue";
         }
 
         if (this.queue) {
           await this.queue.add(envelope.name, envelope, {
             jobId: envelope.id,
           });
-          return;
+          return "queue";
         }
       } catch {
         // Fallback in-memory
@@ -290,6 +297,7 @@ export class EventBusService {
     });
 
     this.triggerInMemoryProcessing();
+    return "in_memory";
   }
 
   private triggerInMemoryProcessing(): void {
@@ -304,6 +312,11 @@ export class EventBusService {
 
           try {
             await this.dispatchDirectly(item.envelope);
+            // SEC-58: Đánh dấu outbox event là PUBLISHED chỉ sau khi các subscriber
+            // đã hoàn tất xử lý thành công qua dispatchDirectly().
+            await this.outboxRepo
+              .markPublished(item.envelope.id)
+              .catch(() => {});
           } catch (err: any) {
             item.attempts++;
             if (item.attempts >= EVENT_BUS_CONSTANTS.DEFAULT_MAX_ATTEMPTS) {
@@ -312,12 +325,31 @@ export class EventBusService {
                 err?.message || String(err),
                 item.attempts,
               );
+              await this.outboxRepo
+                .markFailed(
+                  item.envelope.id,
+                  err?.message || String(err),
+                  item.attempts,
+                )
+                .catch(() => {});
             } else {
-              // Retry with exponential backoff delay
-              await new Promise((r) =>
-                setTimeout(r, Math.min(50 * Math.pow(2, item.attempts), 500)),
+              // SEC-56: Tách rời (decouple) backoff retry khỏi vòng lặp tuần tự (serial while-loop)
+              // nhằm ngăn ngừa Head-of-Line Blocking DoS.
+              // Thay vì await sleep đồng bộ chặn đứng toàn bộ các sự kiện lành mạnh phía sau,
+              // lên lịch re-enqueue qua setTimeout bất đồng bộ và để vòng lặp tiếp tục xử lý các event tiếp theo ngay lập tức.
+              const backoffDelay = Math.min(
+                50 * Math.pow(2, item.attempts),
+                500,
               );
-              this.inMemoryQueue.push(item);
+              const retryTimer = setTimeout(() => {
+                this.activeRetryTimers.delete(retryTimer);
+                this.inMemoryQueue.push(item);
+                this.triggerInMemoryProcessing();
+              }, backoffDelay);
+              if (typeof retryTimer.unref === "function") {
+                retryTimer.unref();
+              }
+              this.activeRetryTimers.add(retryTimer);
             }
           }
         }
@@ -679,6 +711,10 @@ export class EventBusService {
 
   public async close(): Promise<void> {
     this.handlers.clear();
+    for (const timer of this.activeRetryTimers) {
+      clearTimeout(timer);
+    }
+    this.activeRetryTimers.clear();
     this.inMemoryQueue = [];
     if (this.queue) {
       await this.queue.close().catch(() => {});

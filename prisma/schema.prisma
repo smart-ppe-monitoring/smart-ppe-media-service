@@ -63,6 +63,7 @@ model OutboxEvent {
   updatedAt   DateTime  @updatedAt @map("updated_at")
 
   @@index([status, createdAt])
+  @@index([status, updatedAt])
   @@index([eventType])
   @@map("outbox_events")
 }

@@ -134,14 +134,18 @@ export class OutboxRepository {
     tx?: Prisma.TransactionClient,
   ): Promise<void> {
     const client = tx || this.db;
-    await client.outboxEvent.update({
-      where: { id },
-      data: {
-        status: OUTBOX_STATUS.PUBLISHED,
-        publishedAt: new Date(),
-        lastError: null,
-      },
-    });
+    try {
+      await client.outboxEvent.update({
+        where: { id },
+        data: {
+          status: OUTBOX_STATUS.PUBLISHED,
+          publishedAt: new Date(),
+          lastError: null,
+        },
+      });
+    } catch {
+      // Safe fallback if record does not exist or has already been pruned
+    }
   }
 
   /**
