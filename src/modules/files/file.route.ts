@@ -10,6 +10,7 @@ import {
 } from "../../middlewares/permission.middleware";
 import { validate } from "../../middlewares/validate.middleware";
 import { uploadImageMiddleware } from "../../middlewares/upload.middleware";
+import { sharpRateLimitMiddleware } from "../../middlewares/rate-limit.middleware";
 import { PERMISSIONS } from "../../common/constants/permission.constant";
 import {
   fileIdParamSchema,
@@ -35,9 +36,10 @@ router.post(
   controller.requestUploadUrl,
 );
 
-// 2. Tải lên và tối ưu hóa ảnh trực tiếp bằng Sharp (WebP, avatar, resize)
+// 2. Tải lên và tối ưu hóa ảnh trực tiếp bằng Sharp (WebP, avatar, resize - SEC-35: sharpRateLimitMiddleware)
 router.post(
   "/upload-image",
+  sharpRateLimitMiddleware,
   verifyJwtLocally,
   requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
   uploadImageMiddleware.single("image"),
@@ -80,18 +82,20 @@ router.get(
   controller.findById,
 );
 
-// 7. Biến đổi ảnh on-the-fly qua Sharp (Read-only GET - RFC 7231 Safe & Idempotent)
+// 7. Biến đổi ảnh on-the-fly qua Sharp (Read-only GET - RFC 7231 Safe & Idempotent - SEC-35: sharpRateLimitMiddleware)
 router.get(
   "/:id/transform",
+  sharpRateLimitMiddleware,
   optionalVerifyJwtLocally,
   validate(fileIdParamSchema, "params"),
   validate(imageTransformQuerySchema, "query"),
   controller.transformImage,
 );
 
-// 8. Biến đổi ảnh và lưu thành bản ghi tệp mới (Mutation POST - SEC-23: Yêu cầu JWT & Quyền FILE_UPLOAD)
+// 8. Biến đổi ảnh và lưu thành bản ghi tệp mới (Mutation POST - SEC-23: Yêu cầu JWT & Quyền FILE_UPLOAD - SEC-35: sharpRateLimitMiddleware)
 router.post(
   "/:id/transform",
+  sharpRateLimitMiddleware,
   verifyJwtLocally,
   requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
   validate(fileIdParamSchema, "params"),

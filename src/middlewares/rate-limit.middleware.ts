@@ -254,3 +254,17 @@ export const authRateLimitMiddleware = createRateLimiter({
   maxRequests: envConfig.rateLimit.authMaxRequests,
   message: "Too many authentication attempts, please try again later",
 });
+
+/**
+ * Rate Limiter nghiêm ngặt dành riêng cho các tác vụ xử lý và biến đổi ảnh CPU-intensive qua Sharp (SEC-35)
+ * Cấu hình động từ SHARP_RATE_LIMIT_MAX_REQUESTS & SHARP_RATE_LIMIT_WINDOW_MS
+ */
+export const sharpRateLimitMiddleware = createRateLimiter({
+  windowMs: envConfig.rateLimit.sharpWindowMs ?? 60000,
+  maxRequests: envConfig.rateLimit.sharpMaxRequests ?? 30,
+  message: "Too many image processing requests, please try again later",
+  keyGenerator: (req) => {
+    const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+    return `sharp:${clientIp}`;
+  },
+});

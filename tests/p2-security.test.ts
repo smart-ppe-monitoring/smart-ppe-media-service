@@ -17,10 +17,12 @@ import { envConfig } from "../src/config/env.config";
 import { z } from "zod";
 
 import { AUDIT_ACTION } from "../src/common/constants/audit-log.constant";
+import { getMediaPrisma } from "../src/database/prisma.client";
+import { sharpRateLimitMiddleware, createRateLimiter } from "../src/middlewares/rate-limit.middleware";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-33)", { concurrency: false }, () => {
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-35)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -824,6 +826,106 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-33)", { c
         (envConfig.database as any).reportingUrl,
         undefined,
         "REPORTING_DATABASE_URL must not be exposed in media service config",
+      );
+    });
+  });
+
+  // ── SEC-34 ───────────────────────────────────────────────────────────────
+  describe("SEC-34: Prisma Client Constructor Binds to Dynamic Database URL Resolution", () => {
+    test("prisma.client.ts passes explicit datasources.db.url from envConfig.database.url", () => {
+      const clientFile = path.resolve(__dirname, "../src/database/prisma.client.ts");
+      const content = fs.readFileSync(clientFile, "utf-8");
+
+      assert.ok(
+        content.includes("datasources:") &&
+        content.includes("db:") &&
+        content.includes("url: envConfig.database.url"),
+        "getMediaPrisma must pass datasources.db.url from envConfig.database.url",
+      );
+    });
+
+    test("getMediaPrisma returns instantiated PrismaClient without errors", () => {
+      const client = getMediaPrisma();
+      assert.ok(client, "getMediaPrisma must return valid MediaPrismaClient instance");
+    });
+  });
+
+  // ── SEC-35 ───────────────────────────────────────────────────────────────
+  describe("SEC-35: Granular Rate Limiting on Resource-Intensive Sharp Endpoints", () => {
+    test("envConfig.rateLimit defines dedicated sharp rate limit properties", () => {
+      assert.strictEqual(typeof envConfig.rateLimit.sharpWindowMs, "number");
+      assert.strictEqual(typeof envConfig.rateLimit.sharpMaxRequests, "number");
+      assert.ok(envConfig.rateLimit.sharpMaxRequests > 0);
+    });
+
+    test("sharpRateLimitMiddleware limits excessive requests and returns 429", async () => {
+      // Create dedicated test limiter with max 2 requests
+      const testLimiter = createRateLimiter({
+        windowMs: 60000,
+        maxRequests: 2,
+        message: "Too many image processing requests",
+      });
+
+      const req: any = {
+        ip: "192.168.1.100",
+        path: "/api/v1/files/upload-image",
+        headers: {},
+        socket: {},
+      };
+
+      let status = 200;
+      let jsonBody: any = null;
+      const res: any = {
+        setHeader: () => {},
+        status: (s: number) => {
+          status = s;
+          return {
+            json: (b: any) => {
+              jsonBody = b;
+            },
+          };
+        },
+      };
+
+      // Request 1: OK
+      let nextCalled = false;
+      await testLimiter(req, res, () => {
+        nextCalled = true;
+      });
+      assert.strictEqual(nextCalled, true, "First request must pass");
+
+      // Request 2: OK
+      nextCalled = false;
+      await testLimiter(req, res, () => {
+        nextCalled = true;
+      });
+      assert.strictEqual(nextCalled, true, "Second request must pass");
+
+      // Request 3: Blocked (429 Rate Limit Exceeded)
+      nextCalled = false;
+      await testLimiter(req, res, () => {
+        nextCalled = true;
+      });
+      assert.strictEqual(nextCalled, false, "Third request must be blocked");
+      assert.strictEqual(status, 429, "Must return HTTP 429 Too Many Requests");
+      assert.strictEqual(jsonBody?.code, ERROR_CODE.RATE_LIMIT_EXCEEDED);
+    });
+
+    test("file.route.ts mounts sharpRateLimitMiddleware on upload-image and transform endpoints", () => {
+      const routeFile = path.resolve(__dirname, "../src/modules/files/file.route.ts");
+      const content = fs.readFileSync(routeFile, "utf-8");
+
+      assert.ok(
+        content.includes("sharpRateLimitMiddleware"),
+        "file.route.ts must import and use sharpRateLimitMiddleware",
+      );
+      assert.ok(
+        content.includes('"/upload-image",\n  sharpRateLimitMiddleware'),
+        "sharpRateLimitMiddleware must guard POST /upload-image",
+      );
+      assert.ok(
+        content.includes('"/:id/transform",\n  sharpRateLimitMiddleware'),
+        "sharpRateLimitMiddleware must guard /:id/transform endpoints",
       );
     });
   });

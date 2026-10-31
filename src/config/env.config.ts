@@ -77,6 +77,17 @@ const envSchema = z
       .int()
       .positive()
       .default(30),
+    // SEC-35: Granular rate limiting for heavy Sharp image processing endpoints
+    SHARP_RATE_LIMIT_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(60000),
+    SHARP_RATE_LIMIT_MAX_REQUESTS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(30),
 
     // ── Cloudflare R2 ────────────────────────────────────────────────────────
     R2_ACCOUNT_ID: z.string().default(""),
@@ -499,6 +510,8 @@ export const envConfig = {
     maxRequests: _env.RATE_LIMIT_MAX_REQUESTS,
     authWindowMs: _env.AUTH_RATE_LIMIT_WINDOW_MS,
     authMaxRequests: _env.AUTH_RATE_LIMIT_MAX_REQUESTS,
+    sharpWindowMs: _env.SHARP_RATE_LIMIT_WINDOW_MS,
+    sharpMaxRequests: _env.SHARP_RATE_LIMIT_MAX_REQUESTS,
   },
   encryption: {
     key: resolveEncryptionKey(),
