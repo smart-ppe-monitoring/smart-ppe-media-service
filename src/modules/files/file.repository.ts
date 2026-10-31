@@ -5,7 +5,7 @@ import {
   calculatePaginationSkip,
   formatPaginationMeta,
 } from "../../common/helpers/pagination.helper";
-import { buildTsQuery } from "../../common/helpers/fts.helper";
+import { buildTsQuery, escapeSqlLike } from "../../common/helpers/fts.helper";
 import { isUuid } from "../../common/helpers/uuid.helper";
 
 const fileSelect = {
@@ -244,8 +244,10 @@ export class FileRepository {
     }
 
     if (query.mimeType) {
+      // SEC-54: Escape SQL LIKE wildcards (%, _, \) to prevent wildcard injection in MIME filter
+      const escapedMime = escapeSqlLike(query.mimeType);
       whereConditions.push(
-        Prisma.sql`f.mime_type LIKE ${query.mimeType + "%"}`,
+        Prisma.sql`f.mime_type LIKE ${escapedMime + "%"} ESCAPE '\\'`,
       );
     }
 

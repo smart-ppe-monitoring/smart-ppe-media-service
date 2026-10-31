@@ -54,7 +54,8 @@ mediaApp.use(
         imgSrc: ["'self'", "data:", "https:", "blob:"],
       },
     },
-    crossOriginResourcePolicy: { policy: "cross-origin" },
+    // SEC-53: Restrict Cross-Origin Resource Policy to same-origin to prevent unauthorized third-party embedding/hotlinking
+    crossOriginResourcePolicy: { policy: "same-origin" },
   }),
 );
 

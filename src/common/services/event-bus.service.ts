@@ -26,6 +26,7 @@ import {
 export interface PublishEventOptions {
   aggregateId?: string | null;
   traceId?: string;
+  source?: string;
   tx?: Prisma.TransactionClient;
   useOutbox?: boolean;
 }
@@ -206,7 +207,8 @@ export class EventBusService {
       aggregateId: options?.aggregateId ?? null,
       timestamp: Date.now(),
       traceId,
-      source: "template-be-core",
+      // SEC-51: Dynamic service name resolution to prevent hardcoded boilerplate source
+      source: options?.source || envConfig.serviceName || "smart-ppe-media-service",
     };
 
     const useOutbox = options?.useOutbox ?? true;
@@ -571,7 +573,8 @@ export class EventBusService {
               (decryptedPayload as any)?._traceId ||
               (decryptedPayload as any)?.traceId ||
               record.id,
-            source: "template-be-outbox-relay",
+            // SEC-51: Dynamic service name resolution in outbox relay envelope
+            source: `${envConfig.serviceName || "smart-ppe-media-service"}-outbox-relay`,
           };
 
           // Nếu tiến trình hiện tại có handler cho sự kiện này -> dispatch trực tiếp

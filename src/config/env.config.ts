@@ -10,6 +10,7 @@ const envSchema = z
       .enum(["development", "production", "test"])
       .default("development"),
     PORT: z.coerce.number().int().positive().default(8890),
+    SERVICE_NAME: z.string().default("smart-ppe-media-service"),
 
     // ── Database (Database-per-Service Architecture: SEC-33) ─────────────────
     MEDIA_DATABASE_URL: z
@@ -409,6 +410,7 @@ function resolveRedisConfig() {
 
 export const envConfig = {
   nodeEnv: _env.NODE_ENV,
+  serviceName: _env.SERVICE_NAME,
   port: _env.PORT,
   database: {
     url: _env.MEDIA_DATABASE_URL,

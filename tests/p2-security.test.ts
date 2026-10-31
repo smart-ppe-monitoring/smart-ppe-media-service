@@ -25,10 +25,13 @@ import express from "express";
 import { AUDIT_ACTION } from "../src/common/constants/audit-log.constant";
 import { getMediaPrisma, prisma } from "../src/database/prisma.client";
 import { sharpRateLimitMiddleware, createRateLimiter } from "../src/middlewares/rate-limit.middleware";
+import { eventBus } from "../src/common/services/event-bus.service";
+import { escapeSqlLike } from "../src/common/helpers/fts.helper";
+import mediaApp from "../src/media.app";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-44)", { concurrency: false }, () => {
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-54)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -1128,6 +1131,182 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-44)", { c
       assert.ok(nextError, "Should return an error for >100kb payload");
       assert.strictEqual(nextError.status || nextError.statusCode, 413, "Must return HTTP 413 Payload Too Large");
       assert.strictEqual(nextError.type, "entity.too.large");
+    });
+  });
+
+  // ── SEC-51 ───────────────────────────────────────────────────────────────
+  describe("SEC-51: Hardcoded Template Boilerplate Source Name in Event Bus Envelope Corrupts Tracing", () => {
+    test("envConfig defines serviceName defaulting to 'smart-ppe-media-service'", () => {
+      assert.strictEqual(envConfig.serviceName, "smart-ppe-media-service");
+    });
+
+    test("eventBus.publish defaults envelope source to envConfig.serviceName instead of template-be-core", async () => {
+      let publishedEnvelope: any = null;
+      const originalEnqueue = (eventBus as any).enqueueEnvelope;
+      (eventBus as any).enqueueEnvelope = async (env: any) => {
+        publishedEnvelope = env;
+      };
+
+      try {
+        const envelope = await eventBus.publish(
+          EVENT_NAMES.FILE_CREATED,
+          {
+            fileId: "01931580-0000-7000-8000-000000000001",
+            bucketKey: "files/test.png",
+            fileName: "test.png",
+            mimeType: "image/png",
+            size: 1024,
+            folder: "files",
+            isPublic: false,
+          },
+          { useOutbox: false },
+        );
+
+        assert.ok(envelope);
+        assert.strictEqual(envelope.source, "smart-ppe-media-service");
+        assert.notStrictEqual(envelope.source, "template-be-core");
+      } finally {
+        (eventBus as any).enqueueEnvelope = originalEnqueue;
+      }
+    });
+
+    test("eventBus.publish allows custom source override via options", async () => {
+      let publishedEnvelope: any = null;
+      const originalEnqueue = (eventBus as any).enqueueEnvelope;
+      (eventBus as any).enqueueEnvelope = async (env: any) => {
+        publishedEnvelope = env;
+      };
+
+      try {
+        const envelope = await eventBus.publish(
+          EVENT_NAMES.FILE_DELETED,
+          {
+            fileId: "01931580-0000-7000-8000-000000000001",
+            bucketKey: "files/test.png",
+            deletedAt: new Date().toISOString(),
+          },
+          { useOutbox: false, source: "custom-worker" },
+        );
+
+        assert.strictEqual(envelope.source, "custom-worker");
+      } finally {
+        (eventBus as any).enqueueEnvelope = originalEnqueue;
+      }
+    });
+  });
+
+  // ── SEC-52 ───────────────────────────────────────────────────────────────
+  describe("SEC-52: Orphaned Server Entrypoint File Induces Deployment Drift and Unpatched Desynchronization", () => {
+    test("orphaned entrypoint src/media.server.ts does not exist in repository", () => {
+      const mediaServerPath = path.resolve(__dirname, "../src/media.server.ts");
+      assert.strictEqual(
+        fs.existsSync(mediaServerPath),
+        false,
+        "src/media.server.ts must be eliminated to prevent deployment drift",
+      );
+    });
+
+    test("canonical entrypoint src/server.ts exists and package.json points to dist/server.js", () => {
+      const serverPath = path.resolve(__dirname, "../src/server.ts");
+      assert.strictEqual(fs.existsSync(serverPath), true, "src/server.ts must be canonical entrypoint");
+
+      const pkgPath = path.resolve(__dirname, "../package.json");
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+      assert.strictEqual(pkg.main, "dist/server.js");
+      assert.ok(pkg.scripts.start.includes("dist/server.js"));
+      assert.ok(pkg.scripts.dev.includes("src/server.ts"));
+    });
+  });
+
+  // ── SEC-53 ───────────────────────────────────────────────────────────────
+  describe("SEC-53: Permissive Global Cross-Origin Resource Policy Allows Unauthorized Third-Party Embedding", () => {
+    test("media.app.ts configures crossOriginResourcePolicy as 'same-origin'", () => {
+      const appFile = path.resolve(__dirname, "../src/media.app.ts");
+      const content = fs.readFileSync(appFile, "utf-8");
+
+      assert.ok(
+        content.includes('crossOriginResourcePolicy: { policy: "same-origin" }'),
+        "media.app.ts must enforce same-origin CORP policy",
+      );
+      assert.ok(
+        !content.includes('crossOriginResourcePolicy: { policy: "cross-origin" }'),
+        "media.app.ts must NOT use permissive cross-origin CORP globally",
+      );
+    });
+
+    test("mediaApp HTTP pipeline emits Cross-Origin-Resource-Policy: same-origin header", async () => {
+      const req: any = {
+        method: "GET",
+        url: "/health",
+        headers: { host: "localhost" },
+      };
+
+      let corpHeader = "";
+      const res: any = {
+        setHeader: (name: string, val: string) => {
+          if (name.toLowerCase() === "cross-origin-resource-policy") {
+            corpHeader = val;
+          }
+        },
+        getHeader: (name: string) => {
+          if (name.toLowerCase() === "cross-origin-resource-policy") return corpHeader;
+          return undefined;
+        },
+        writeHead: () => res,
+        end: () => {},
+      };
+
+      await new Promise<void>((resolve) => {
+        mediaApp(req, res, () => resolve());
+        setTimeout(resolve, 50);
+      });
+
+      assert.strictEqual(corpHeader, "same-origin", "Response must include Cross-Origin-Resource-Policy: same-origin");
+    });
+  });
+
+  // ── SEC-54 ───────────────────────────────────────────────────────────────
+  describe("SEC-54: Raw SQL LIKE Operator Permits Wildcard Injection in Full-Text Search MIME Filter", () => {
+    test("escapeSqlLike correctly escapes %, _, and backslash characters", () => {
+      assert.strictEqual(escapeSqlLike("image/png"), "image/png");
+      assert.strictEqual(escapeSqlLike("image/%"), "image/\\%");
+      assert.strictEqual(escapeSqlLike("image/_"), "image/\\_");
+      assert.strictEqual(escapeSqlLike("image\\%_"), "image\\\\\\%\\_");
+      assert.strictEqual(escapeSqlLike(""), "");
+    });
+
+    test("searchFts escapes wildcard characters in query.mimeType and includes ESCAPE clause", async () => {
+      let passedQueries: any[] = [];
+      const originalTx = (prisma as any).$transaction;
+      const originalRaw = (prisma as any).$queryRaw;
+
+      (prisma as any).$queryRaw = (strings: any, ...values: any[]) => {
+        const queryObj = { strings, values };
+        passedQueries.push(queryObj);
+        return queryObj;
+      };
+      (prisma as any).$transaction = async () => {
+        return [
+          [],
+          [{ count: 0n }],
+        ];
+      };
+
+      try {
+        const repo = new FileRepository();
+        // Wildcard attack payload in mimeType
+        await repo.searchFts({ search: "ppe", mimeType: "image/_%" }, "admin", true);
+
+        const queryStr = JSON.stringify(passedQueries);
+        assert.ok(
+          queryStr.includes("image/\\\\_\\\\%"),
+          "Wildcard sequences in mimeType must be escaped",
+        );
+        assert.ok(queryStr.includes("ESCAPE"), "Query must include explicit ESCAPE clause");
+      } finally {
+        (prisma as any).$transaction = originalTx;
+        (prisma as any).$queryRaw = originalRaw;
+      }
     });
   });
 });
