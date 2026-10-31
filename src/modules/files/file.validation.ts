@@ -90,7 +90,13 @@ export const listFilesSchema = z.object({
   userId: z.string().uuid("User ID phải là UUID").optional(),
   sortBy: z.enum(["createdAt", "fileName", "size"]).optional(),
   order: z.enum(["asc", "desc"]).optional(),
-  page: z.coerce.number().int().positive().optional().default(1),
+  page: z.coerce
+    .number()
+    .int()
+    .positive("Số trang phải là số nguyên dương")
+    .max(1000, "Số trang không được vượt quá 1000")
+    .optional()
+    .default(1),
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
 });
 

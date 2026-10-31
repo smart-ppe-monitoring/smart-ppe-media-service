@@ -90,8 +90,10 @@ const corsOptions: cors.CorsOptions = {
 };
 mediaApp.use(cors(corsOptions));
 mediaApp.use(morgan(envConfig.nodeEnv === "production" ? "combined" : "dev"));
-mediaApp.use(express.json({ limit: "20mb" }));
-mediaApp.use(express.urlencoded({ extended: true, limit: "20mb" }));
+// SEC-44: Restrict global body parsers to 100kb to prevent V8 Event Loop starvation and JSON ReDoS.
+// Direct file uploads stream via Multer multipart or direct S3/R2 presigned URLs.
+mediaApp.use(express.json({ limit: "100kb" }));
+mediaApp.use(express.urlencoded({ extended: true, limit: "100kb" }));
 mediaApp.use(cookieParser());
 
 // 3. Health check endpoints cho Traefik Gateway & Monitoring

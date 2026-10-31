@@ -6,6 +6,7 @@ import {
   formatPaginationMeta,
 } from "../../common/helpers/pagination.helper";
 import { buildTsQuery } from "../../common/helpers/fts.helper";
+import { isUuid } from "../../common/helpers/uuid.helper";
 
 const fileSelect = {
   id: true,
@@ -217,7 +218,8 @@ export class FileRepository {
     ];
 
     if (!canManageAll) {
-      if (currentUserId) {
+      // SEC-42: Validate UUID format to prevent PostgreSQL 22P02 syntax cast crashes on non-UUID subjects
+      if (currentUserId && isUuid(currentUserId)) {
         whereConditions.push(
           Prisma.sql`(f.is_public = true OR f.user_id = ${currentUserId}::uuid)`,
         );
@@ -225,7 +227,12 @@ export class FileRepository {
         whereConditions.push(Prisma.sql`f.is_public = true`);
       }
     } else if (query.userId) {
-      whereConditions.push(Prisma.sql`f.user_id = ${query.userId}::uuid`);
+      if (isUuid(query.userId)) {
+        whereConditions.push(Prisma.sql`f.user_id = ${query.userId}::uuid`);
+      } else {
+        // query.userId is non-UUID: return 0 results safely without throwing 22P02 exception
+        whereConditions.push(Prisma.sql`1 = 0`);
+      }
     }
 
     if (query.folder) {

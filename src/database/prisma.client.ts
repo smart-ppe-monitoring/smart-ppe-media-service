@@ -38,6 +38,10 @@ export const mediaPrisma = new Proxy({} as MediaPrismaClient, {
   get(_target, prop) {
     return (getMediaPrisma() as any)[prop];
   },
+  set(_target, prop, value) {
+    (getMediaPrisma() as any)[prop] = value;
+    return true;
+  },
 });
 
 export const prisma = mediaPrisma;

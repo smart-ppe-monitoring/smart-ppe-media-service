@@ -12,17 +12,23 @@ import { EVENT_NAMES } from "../src/common/constants/event.constant";
 import { StorageCleanupSubscriber } from "../src/common/subscribers/storage-cleanup.subscriber";
 import { FileService } from "../src/modules/files/file.service";
 import { R2Service } from "../src/common/services/r2.service";
-import { directImageUploadSchema } from "../src/modules/files/file.validation";
+import { directImageUploadSchema, listFilesSchema } from "../src/modules/files/file.validation";
+import {
+  calculatePaginationSkip,
+  formatPaginationMeta,
+  MAX_PAGINATION_PAGE,
+} from "../src/common/helpers/pagination.helper";
 import { envConfig } from "../src/config/env.config";
 import { z } from "zod";
+import express from "express";
 
 import { AUDIT_ACTION } from "../src/common/constants/audit-log.constant";
-import { getMediaPrisma } from "../src/database/prisma.client";
+import { getMediaPrisma, prisma } from "../src/database/prisma.client";
 import { sharpRateLimitMiddleware, createRateLimiter } from "../src/middlewares/rate-limit.middleware";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-35)", { concurrency: false }, () => {
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-44)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -927,6 +933,201 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-35)", { c
         content.includes('"/:id/transform",\n  sharpRateLimitMiddleware'),
         "sharpRateLimitMiddleware must guard /:id/transform endpoints",
       );
+    });
+  });
+
+  // ── SEC-42 ───────────────────────────────────────────────────────────────
+  describe("SEC-42: Unhandled PostgreSQL UUID Cast Exception in Raw Full-Text Search Query", () => {
+    test("searchFts safely handles non-UUID currentUserId without throwing 22P02 DB cast syntax error", async () => {
+      let passedQueries: any[] = [];
+      const originalTx = (prisma as any).$transaction;
+      const originalRaw = (prisma as any).$queryRaw;
+
+      (prisma as any).$queryRaw = (strings: any, ...values: any[]) => {
+        const queryObj = { strings, values };
+        passedQueries.push(queryObj);
+        return queryObj;
+      };
+      (prisma as any).$transaction = async () => {
+        return [
+          [],
+          [{ count: 0n }],
+        ];
+      };
+
+      try {
+        const repo = new FileRepository();
+        // Non-UUID currentUserId (e.g., service account or mock principal "admin")
+        const result = await repo.searchFts({ search: "safety" }, "admin", false);
+
+        assert.ok(result);
+        assert.strictEqual(Array.isArray(result.data), true);
+        const queryStr = JSON.stringify(passedQueries);
+        assert.ok(!queryStr.includes("admin::uuid"), "Non-UUID currentUserId must NOT have ::uuid cast appended");
+        assert.ok(queryStr.includes("is_public = true"), "Non-UUID user must be constrained to public files");
+      } finally {
+        (prisma as any).$transaction = originalTx;
+        (prisma as any).$queryRaw = originalRaw;
+      }
+    });
+
+    test("searchFts correctly applies UUID cast for valid UUID currentUserId", async () => {
+      let passedQueries: any[] = [];
+      const originalTx = (prisma as any).$transaction;
+      const originalRaw = (prisma as any).$queryRaw;
+
+      (prisma as any).$queryRaw = (strings: any, ...values: any[]) => {
+        const queryObj = { strings, values };
+        passedQueries.push(queryObj);
+        return queryObj;
+      };
+      (prisma as any).$transaction = async () => {
+        return [
+          [],
+          [{ count: 0n }],
+        ];
+      };
+
+      try {
+        const repo = new FileRepository();
+        const validUuid = "01931580-0000-7000-8000-000000000001";
+        await repo.searchFts({ search: "ppe" }, validUuid, false);
+
+        const queryStr = JSON.stringify(passedQueries);
+        assert.ok(queryStr.includes("::uuid"), "Valid UUID currentUserId must include ::uuid cast in SQL");
+      } finally {
+        (prisma as any).$transaction = originalTx;
+        (prisma as any).$queryRaw = originalRaw;
+      }
+    });
+
+    test("searchFts safely handles query.userId in canManageAll mode for valid vs non-UUID", async () => {
+      let passedQueries: any[] = [];
+      const originalTx = (prisma as any).$transaction;
+      const originalRaw = (prisma as any).$queryRaw;
+
+      (prisma as any).$queryRaw = (strings: any, ...values: any[]) => {
+        const queryObj = { strings, values };
+        passedQueries.push(queryObj);
+        return queryObj;
+      };
+      (prisma as any).$transaction = async () => {
+        return [
+          [],
+          [{ count: 0n }],
+        ];
+      };
+
+      try {
+        const repo = new FileRepository();
+        const validUuid = "01931580-0000-7000-8000-000000000001";
+
+        // Non-UUID query.userId when canManageAll = true
+        await repo.searchFts({ search: "ppe", userId: "service-worker" as any }, validUuid, true);
+        const invalidQueryStr = JSON.stringify(passedQueries);
+        assert.ok(invalidQueryStr.includes("1 = 0"), "Non-UUID query.userId must inject 1 = 0 condition");
+        assert.ok(!invalidQueryStr.includes("service-worker::uuid"), "Non-UUID query.userId must NOT cast ::uuid");
+
+        // Reset passedQueries
+        passedQueries = [];
+
+        // Valid UUID query.userId when canManageAll = true
+        const targetUserUuid = "01931580-0000-7000-8000-000000000002";
+        await repo.searchFts({ search: "ppe", userId: targetUserUuid }, validUuid, true);
+        const validQueryStr = JSON.stringify(passedQueries);
+        assert.ok(validQueryStr.includes("::uuid"), "Valid UUID query.userId must include ::uuid cast");
+      } finally {
+        (prisma as any).$transaction = originalTx;
+        (prisma as any).$queryRaw = originalRaw;
+      }
+    });
+  });
+
+  // ── SEC-43 ───────────────────────────────────────────────────────────────
+  describe("SEC-43: Unbounded Pagination Page Parameter Causes Extreme PostgreSQL Offset Exhaustion DoS", () => {
+    test("listFilesSchema rejects excessive page numbers > 1000", () => {
+      const invalidExcessive = listFilesSchema.safeParse({ page: "100000000" });
+      assert.strictEqual(invalidExcessive.success, false);
+      if (!invalidExcessive.success) {
+        assert.ok(invalidExcessive.error.issues.some((i) => i.message.includes("1000")));
+      }
+
+      const invalid1001 = listFilesSchema.safeParse({ page: 1001 });
+      assert.strictEqual(invalid1001.success, false);
+    });
+
+    test("listFilesSchema accepts valid page numbers between 1 and 1000", () => {
+      const valid1 = listFilesSchema.safeParse({ page: 1 });
+      assert.strictEqual(valid1.success, true);
+      assert.strictEqual(valid1.data?.page, 1);
+
+      const valid1000 = listFilesSchema.safeParse({ page: 1000 });
+      assert.strictEqual(valid1000.success, true);
+      assert.strictEqual(valid1000.data?.page, 1000);
+    });
+
+    test("calculatePaginationSkip and formatPaginationMeta enforce MAX_PAGINATION_PAGE defense-in-depth", () => {
+      assert.strictEqual(MAX_PAGINATION_PAGE, 1000);
+
+      const skipResult = calculatePaginationSkip(999999, 20);
+      assert.strictEqual(skipResult.page, 1000, "calculatePaginationSkip must cap page at MAX_PAGINATION_PAGE (1000)");
+      assert.strictEqual(skipResult.skip, (1000 - 1) * 20);
+
+      const metaResult = formatPaginationMeta(999999, 20, 50000);
+      assert.strictEqual(metaResult.page, 1000, "formatPaginationMeta must cap page at MAX_PAGINATION_PAGE (1000)");
+    });
+  });
+
+  // ── SEC-44 ───────────────────────────────────────────────────────────────
+  describe("SEC-44: Blanket 20MB Express Body Parser Limit Enables Event Loop Starvation and Node.js ReDoS", () => {
+    test("media.app.ts source code specifies 100kb limit on express.json and express.urlencoded", () => {
+      const appFile = path.resolve(__dirname, "../src/media.app.ts");
+      const content = fs.readFileSync(appFile, "utf-8");
+
+      assert.ok(
+        content.includes('express.json({ limit: "100kb" })'),
+        "media.app.ts must configure express.json with limit 100kb",
+      );
+      assert.ok(
+        content.includes('express.urlencoded({ extended: true, limit: "100kb" })'),
+        "media.app.ts must configure express.urlencoded with limit 100kb",
+      );
+      assert.ok(
+        !content.includes('express.json({ limit: "20mb" })'),
+        "media.app.ts must NOT use 20mb json limit globally",
+      );
+    });
+
+    test("express.json middleware configured with 100kb rejects payloads exceeding limit with HTTP 413", async () => {
+      const jsonParser = express.json({ limit: "100kb" });
+
+      // Create a payload larger than 100kb (~125KB)
+      const largePayload = JSON.stringify({ data: "a".repeat(125 * 1024) });
+      const { Readable } = await import("node:stream");
+      const stream = new Readable();
+      stream.push(largePayload);
+      stream.push(null);
+
+      const req: any = Object.assign(stream, {
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(largePayload).toString(),
+        },
+      });
+
+      let nextError: any = null;
+      const res: any = {};
+
+      await new Promise<void>((resolve) => {
+        jsonParser(req, res, (err: any) => {
+          nextError = err;
+          resolve();
+        });
+      });
+
+      assert.ok(nextError, "Should return an error for >100kb payload");
+      assert.strictEqual(nextError.status || nextError.statusCode, 413, "Must return HTTP 413 Payload Too Large");
+      assert.strictEqual(nextError.type, "entity.too.large");
     });
   });
 });
