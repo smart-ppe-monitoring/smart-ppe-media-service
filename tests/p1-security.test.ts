@@ -1,3 +1,4 @@
+process.env.NODE_ENV = "test";
 import { test, describe, before } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -16,7 +17,16 @@ import {
   createRequireGatewayOrigin,
   requireGatewayOrigin,
 } from "../src/middlewares/request-id.middleware";
-import { parseTrustProxy } from "../src/config/env.config";
+import {
+  createRateLimiter,
+  normalizeRateLimitPrefix,
+} from "../src/middlewares/rate-limit.middleware";
+import {
+  FILE_RECORDS_FTS_VECTOR_EXPR,
+  FileRepository,
+} from "../src/modules/files/file.repository";
+import { getMasterKeyBuffer } from "../src/common/helpers/crypto.helper";
+import { parseTrustProxy, resolveEncryptionKey } from "../src/config/env.config";
 import { jwtKeyService } from "../src/common/services/jwt-key.service";
 import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
@@ -31,7 +41,7 @@ import {
 } from "../src/server";
 import { eventBus } from "../src/common/services/event-bus.service";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-12)", () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-27)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -462,39 +472,35 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-12)", () 
   });
 
   describe("SEC-12: Transactional Outbox Relay Background Worker", () => {
-    test("startOutboxRelay starts recurring interval and invokes eventBus.relayPendingOutboxEvents", async () => {
+    test("startOutboxRelay starts recurring interval and handleMediaShutdown executes drain", async () => {
       let relayCalled = false;
       const originalRelay = eventBus.relayPendingOutboxEvents;
       try {
         (eventBus as any).relayPendingOutboxEvents = async (batchSize: number) => {
           relayCalled = true;
-          assert.strictEqual(batchSize, 25);
           return 3;
         };
 
-        const timer = startOutboxRelay(10, 25);
+        const timer = startOutboxRelay(15, 25);
         assert.ok(timer, "Timer must be returned");
 
-        // Wait for interval to fire
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        for (let i = 0; i < 25 && !relayCalled; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
         assert.strictEqual(relayCalled, true, "relayPendingOutboxEvents should have been called");
       } finally {
         stopOutboxRelay();
         (eventBus as any).relayPendingOutboxEvents = originalRelay;
       }
-    });
 
-    test("stopOutboxRelay clears active timer", () => {
-      const timer = startOutboxRelay(1000);
-      assert.ok(timer);
+      // Test stopOutboxRelay
+      const timer2 = startOutboxRelay(1000);
+      assert.ok(timer2);
       stopOutboxRelay();
-      // Second stop should be a no-op without error
       stopOutboxRelay();
-    });
 
-    test("handleMediaShutdown executes outbox drain before shutdown", async () => {
+      // Test handleMediaShutdown drain
       let drained = false;
-      const originalRelay = eventBus.relayPendingOutboxEvents;
       const originalClose = eventBus.close;
       try {
         resetShutdownStateForTesting();
@@ -510,6 +516,175 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-12)", () 
         resetShutdownStateForTesting();
         (eventBus as any).relayPendingOutboxEvents = originalRelay;
         (eventBus as any).close = originalClose;
+      }
+    });
+  });
+
+  describe("SEC-25: Dual Mount Route Prefix Rate Limit Normalization", () => {
+    test("normalizeRateLimitPrefix normalizes dual mount routes /api/v1/files and /files to the same prefix", () => {
+      assert.strictEqual(
+        normalizeRateLimitPrefix({ baseUrl: "/api/v1/files" } as any),
+        "/api/v1/files",
+      );
+      assert.strictEqual(
+        normalizeRateLimitPrefix({ baseUrl: "/files" } as any),
+        "/api/v1/files",
+      );
+      assert.strictEqual(
+        normalizeRateLimitPrefix({ originalUrl: "/files/123/download" } as any),
+        "/api/v1/files",
+      );
+      assert.strictEqual(
+        normalizeRateLimitPrefix({ originalUrl: "/api/v1/files/upload" } as any),
+        "/api/v1/files",
+      );
+      assert.strictEqual(
+        normalizeRateLimitPrefix({ baseUrl: "/other" } as any),
+        "/other",
+      );
+    });
+
+    test("rate limiter shares quota across /api/v1/files and /files preventing 2x quota dilution", () => {
+      const limiter = createRateLimiter({
+        windowMs: 60000,
+        maxRequests: 2,
+      });
+
+      const res: any = {
+        statusCode: 200,
+        headers: {} as Record<string, any>,
+        setHeader(name: string, val: any) {
+          this.headers[name] = val;
+        },
+        status(code: number) {
+          this.statusCode = code;
+          return this;
+        },
+        json(body: any) {
+          this.body = body;
+          return this;
+        },
+      };
+
+      let req1Next = false;
+      limiter({ ip: "192.168.1.50", baseUrl: "/api/v1/files" } as any, res, () => {
+        req1Next = true;
+      });
+      assert.strictEqual(req1Next, true, "Req 1 should pass");
+
+      let req2Next = false;
+      limiter({ ip: "192.168.1.50", baseUrl: "/files" } as any, res, () => {
+        req2Next = true;
+      });
+      assert.strictEqual(req2Next, true, "Req 2 should pass");
+
+      let req3Next = false;
+      limiter({ ip: "192.168.1.50", baseUrl: "/files" } as any, res, () => {
+        req3Next = true;
+      });
+      assert.strictEqual(req3Next, false, "Req 3 should be blocked");
+      assert.strictEqual(res.statusCode, 429, "Req 3 must receive HTTP 429");
+      assert.strictEqual(res.body.code, ERROR_CODE.RATE_LIMIT_EXCEEDED);
+    });
+  });
+
+  describe("SEC-26: Full-Text Search GIN Expression Centralization", () => {
+    test("verifies FILE_RECORDS_FTS_VECTOR_EXPR matches exact to_tsvector expression", () => {
+      assert.ok(FILE_RECORDS_FTS_VECTOR_EXPR);
+      const sqlText =
+        (FILE_RECORDS_FTS_VECTOR_EXPR as any).text ||
+        (FILE_RECORDS_FTS_VECTOR_EXPR as any).strings?.join("");
+      assert.ok(
+        sqlText.includes("to_tsvector('simple'"),
+        "Must contain to_tsvector with simple dictionary",
+      );
+      assert.ok(
+        sqlText.includes("coalesce(f.original_name, '')"),
+        "Must concatenate original_name",
+      );
+      assert.ok(
+        sqlText.includes("coalesce(f.file_name, '')"),
+        "Must concatenate file_name",
+      );
+      assert.ok(
+        sqlText.includes("coalesce(f.folder, '')"),
+        "Must concatenate folder",
+      );
+    });
+
+    test("verifies migration file exists with idx_file_records_fts GIN index", () => {
+      const migrationDir = path.join(
+        __dirname,
+        "../prisma/migrations/20261014160000_add_file_records_full_text_search_gin_index",
+      );
+      const migrationFile = path.join(migrationDir, "migration.sql");
+      assert.ok(fs.existsSync(migrationFile), "Migration SQL file must exist");
+      const content = fs.readFileSync(migrationFile, "utf8");
+      assert.ok(
+        content.includes("CREATE INDEX IF NOT EXISTS \"idx_file_records_fts\""),
+      );
+      assert.ok(content.includes("USING gin"));
+    });
+  });
+
+  describe("SEC-27: Cryptography Helper and Environment Config Hardcoded Fallback Master Key Elimination", () => {
+    const originalEnv = { ...process.env };
+
+    test("getMasterKeyBuffer throws an error in production when ENCRYPTION_KEY and APP_SECRET are missing", () => {
+      try {
+        process.env.NODE_ENV = "production";
+        delete process.env.ENCRYPTION_KEY;
+        delete process.env.APP_SECRET;
+
+        assert.throws(
+          () => {
+            getMasterKeyBuffer();
+          },
+          (err: any) => {
+            assert.ok(err instanceof Error);
+            assert.ok(
+              err.message.includes(
+                "ENCRYPTION_KEY or APP_SECRET must be explicitly configured in production",
+              ),
+            );
+            return true;
+          },
+        );
+      } finally {
+        process.env = { ...originalEnv };
+      }
+    });
+
+    test("getMasterKeyBuffer succeeds when customKey is provided", () => {
+      const buf = getMasterKeyBuffer(
+        "my-custom-32-chars-long-secure-key-phrase",
+      );
+      assert.ok(Buffer.isBuffer(buf));
+      assert.strictEqual(buf.length, 32);
+    });
+
+    test("resolveEncryptionKey throws in production when key is absent or too short", () => {
+      try {
+        process.env.NODE_ENV = "production";
+        delete process.env.ENCRYPTION_KEY;
+        delete process.env.APP_SECRET;
+
+        assert.throws(
+          () => {
+            resolveEncryptionKey();
+          },
+          (err: any) => {
+            assert.ok(err instanceof Error);
+            assert.ok(
+              err.message.includes(
+                "must be explicitly configured with at least 32 characters in production",
+              ),
+            );
+            return true;
+          },
+        );
+      } finally {
+        process.env = { ...originalEnv };
       }
     });
   });

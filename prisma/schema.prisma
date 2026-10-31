@@ -28,6 +28,7 @@ model FileRecord {
   @@index([folder, isPublic])
   @@index([isConfirmed, createdAt])
   @@index([deletedAt])
+  // Note: Functional GIN index "idx_file_records_fts" on to_tsvector('simple', ...) is managed via migration for PostgreSQL Full-Text Search (SEC-26)
   @@map("file_records")
 }
 

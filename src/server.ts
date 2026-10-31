@@ -64,13 +64,17 @@ export function stopOutboxRelay(): void {
  * 4. Quét dọn tệp tin rác mồ côi (orphan files cleanup)
  * 5. Relay các sự kiện Transactional Outbox sang message bus (SEC-12)
  */
-export const server =
-  process.env.NODE_ENV === "test"
-    ? null
-    : mediaApp.listen(PORT, async () => {
-        console.log(
-          `[Media Service] Running on http://localhost:${PORT} in ${envConfig.nodeEnv} mode`,
-        );
+const isTestEnvironment =
+  process.env.NODE_ENV === "test" ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
+  process.argv.some((arg) => arg.includes("test"));
+
+export const server = isTestEnvironment
+  ? null
+  : mediaApp.listen(PORT, async () => {
+      console.log(
+        `[Media Service] Running on http://localhost:${PORT} in ${envConfig.nodeEnv} mode`,
+      );
 
         // 1. Đăng ký subscriber lắng nghe events liên quan tới storage
         storageCleanupSubscriber.register();
@@ -157,7 +161,7 @@ export async function handleMediaShutdown(signal: string): Promise<void> {
 
     console.log("[Media Service] Graceful shutdown completed cleanly.");
     clearTimeout(forceExitTimer);
-    if (process.env.NODE_ENV !== "test") {
+    if (process.env.NODE_ENV !== "test" && !process.env.NODE_TEST_CONTEXT) {
       process.exit(0);
     }
   } catch (err: any) {
@@ -166,7 +170,7 @@ export async function handleMediaShutdown(signal: string): Promise<void> {
       err.message,
     );
     clearTimeout(forceExitTimer);
-    if (process.env.NODE_ENV !== "test") {
+    if (process.env.NODE_ENV !== "test" && !process.env.NODE_TEST_CONTEXT) {
       process.exit(1);
     }
   }

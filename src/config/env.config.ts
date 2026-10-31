@@ -330,20 +330,24 @@ export function parseTrustProxy(
   return val;
 }
 
-/** Giải quyết encryption key theo thứ tự ưu tiên: ENCRYPTION_KEY > APP_SECRET. Tuyệt đối không fallback sang JWT_ACCESS_SECRET trong production */
-function resolveEncryptionKey(): string {
-  const key = _env.ENCRYPTION_KEY || _env.APP_SECRET;
+/** Giải quyết encryption key theo thứ tự ưu tiên: ENCRYPTION_KEY > APP_SECRET. Tuyệt đối không fallback sang JWT_ACCESS_SECRET trong production (SEC-27) */
+export function resolveEncryptionKey(
+  nodeEnv: string = process.env.NODE_ENV || _env.NODE_ENV,
+): string {
+  const key =
+    process.env.ENCRYPTION_KEY ||
+    _env.ENCRYPTION_KEY ||
+    process.env.APP_SECRET ||
+    _env.APP_SECRET;
   if (key && key.length >= 32) {
     return key;
   }
-  if (_env.NODE_ENV === "production") {
+  if (nodeEnv === "production") {
     throw new Error(
       "ENCRYPTION_KEY or APP_SECRET must be explicitly configured with at least 32 characters in production",
     );
   }
-  return (
-    key || _env.JWT_ACCESS_SECRET || "default_32_bytes_secret_key_aes256_gcm!!"
-  );
+  return key || "default_32_bytes_secret_key_aes256_gcm!!";
 }
 
 /** Phân giải cấu hình Redis: ưu tiên REDIS_URL (DSN) nếu có, fallback sang biến đơn */

@@ -23,6 +23,13 @@ const fileSelect = {
   updatedAt: true,
 } satisfies Prisma.FileRecordSelect;
 
+/**
+ * Biểu thức tính tsvector chuẩn hóa phục vụ Full-Text Search trên bảng file_records.
+ * Biểu thức này khớp chính xác 100% với GIN index `idx_file_records_fts` trong CSDL PostgreSQL (SEC-26),
+ * cho phép PostgreSQL thực thi Bitmap Index Scan thay vì Seq Scan trên toàn bộ bảng.
+ */
+export const FILE_RECORDS_FTS_VECTOR_EXPR = Prisma.sql`to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, ''))`;
+
 export class FileRepository {
   create(data: {
     userId?: string | null;
@@ -191,7 +198,7 @@ export class FileRepository {
     const whereConditions: Prisma.Sql[] = [
       Prisma.sql`f.deleted_at IS NULL`,
       Prisma.sql`f.is_confirmed = true`,
-      Prisma.sql`to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, '')) @@ to_tsquery('simple', ${tsQuery})`,
+      Prisma.sql`${FILE_RECORDS_FTS_VECTOR_EXPR} @@ to_tsquery('simple', ${tsQuery})`,
     ];
 
     if (!canManageAll) {
@@ -245,7 +252,7 @@ export class FileRepository {
           f.id, f.user_id, f.original_name, f.file_name, f.mime_type,
           f.size, f.bucket_key, f.folder, f.is_public, f.is_confirmed,
           f.metadata, f.created_at, f.updated_at,
-          ts_rank(to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, '')), to_tsquery('simple', ${tsQuery})) as rank
+          ts_rank(${FILE_RECORDS_FTS_VECTOR_EXPR}, to_tsquery('simple', ${tsQuery})) as rank
         FROM file_records f
         ${whereClause}
         ORDER BY rank DESC, f.created_at DESC
@@ -281,6 +288,21 @@ export class FileRepository {
       data,
       meta: formatPaginationMeta(safePage, safeLimit, total),
     };
+  }
+
+  /**
+   * Đảm bảo chỉ mục GIN cho Full-Text Search tồn tại trên bảng file_records (SEC-26).
+   */
+  async ensureFtsIndex(): Promise<void> {
+    try {
+      await prisma.$executeRawUnsafe(`
+        CREATE INDEX IF NOT EXISTS "idx_file_records_fts" ON "file_records" USING gin (
+          to_tsvector('simple', coalesce("original_name", '') || ' ' || coalesce("file_name", '') || ' ' || coalesce("folder", ''))
+        );
+      `);
+    } catch {
+      // Ignored when offline or in test environments
+    }
   }
 
   async delete(id: string) {

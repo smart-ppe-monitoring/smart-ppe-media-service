@@ -6,13 +6,25 @@ const AUTH_TAG_LENGTH = 16; // 128-bit auth tag
 
 /**
  * Trích xuất / chuẩn hóa 32-byte key từ master key string qua SHA-256.
+ * Ném lỗi nghiêm ngặt nếu thiếu ENCRYPTION_KEY / APP_SECRET trên môi trường production (SEC-27).
  */
-function getMasterKeyBuffer(customKey?: string): Buffer {
+export function getMasterKeyBuffer(customKey?: string): Buffer {
   const rawKey =
     customKey ||
     process.env.ENCRYPTION_KEY ||
-    "default-smart-ppe-master-encryption-key-32b";
-  return crypto.createHash("sha256").update(rawKey).digest();
+    process.env.APP_SECRET;
+
+  if (!rawKey) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        "ENCRYPTION_KEY or APP_SECRET must be explicitly configured in production. Plaintext fallback keys are prohibited.",
+      );
+    }
+  }
+
+  const effectiveKey =
+    rawKey || "default-smart-ppe-master-encryption-key-32b";
+  return crypto.createHash("sha256").update(effectiveKey).digest();
 }
 
 /**
