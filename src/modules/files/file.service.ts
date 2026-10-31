@@ -513,7 +513,8 @@ export class FileService {
       role === ROLES.ADMIN ||
       role === "ADMIN" ||
       userPermissions.includes(PERMISSIONS.FILE_MANAGE);
-    const isOwner = (file.userId ?? null) === (userId ?? null);
+    // SEC-20: Do not treat null actor and null uploader as matching. Explicitly require both IDs to match.
+    const isOwner = Boolean(userId && file.userId && file.userId === userId);
     const hasDeletePermission = userPermissions.includes(
       PERMISSIONS.FILE_DELETE,
     );
@@ -643,7 +644,8 @@ export class FileService {
         size: processed.info.size,
         bucketKey,
         folder,
-        isPublic: options.isPublic ?? true,
+        // SEC-22: Secure defaults: Default isPublic to false instead of true
+        isPublic: options.isPublic ?? false,
         metadata: {
           width: processed.info.width,
           height: processed.info.height,

@@ -105,6 +105,16 @@ const envSchema = z
     PPE_MINIO_BUCKET_EVIDENCES: z.string().default("ppe-evidences"),
     PPE_MINIO_FORCE_PATH_STYLE: z.string().default("true"),
 
+    // ── Object Storage / S3 / MinIO Standard (SEC-21) ────────────────────────
+    S3_ENDPOINT: z.string().default(""),
+    S3_PORT: z.coerce.number().int().positive().optional(),
+    S3_USE_SSL: z.string().default("false"),
+    S3_ACCESS_KEY: z.string().default(""),
+    S3_SECRET_KEY: z.string().default(""),
+    S3_BUCKET: z.string().default(""),
+    S3_REGION: z.string().default("us-east-1"),
+    S3_FORCE_PATH_STYLE: z.string().default("true"),
+
     // ── Notification Service & Worker (Phase 5: Satellite Microservice) ──────
     NOTIFICATION_WORKER_ENABLED: z.string().default("true"),
     NOTIFICATION_WORKER_INTERVAL_MS: z.coerce
@@ -484,6 +494,16 @@ export const envConfig = {
     secretAccessKey: _env.PPE_MINIO_ROOT_PASSWORD,
     bucketEvidences: _env.PPE_MINIO_BUCKET_EVIDENCES,
     forcePathStyle: _env.PPE_MINIO_FORCE_PATH_STYLE !== "false",
+  },
+  s3: {
+    endpoint: _env.S3_ENDPOINT || _env.PPE_MINIO_ENDPOINT || "",
+    port: _env.S3_PORT,
+    useSsl: _env.S3_USE_SSL === "true",
+    accessKeyId: _env.S3_ACCESS_KEY || _env.PPE_MINIO_ROOT_USER || "",
+    secretAccessKey: _env.S3_SECRET_KEY || _env.PPE_MINIO_ROOT_PASSWORD || "",
+    bucket: _env.S3_BUCKET || _env.PPE_MINIO_BUCKET_EVIDENCES || "",
+    region: _env.S3_REGION || "us-east-1",
+    forcePathStyle: _env.S3_FORCE_PATH_STYLE !== "false",
   },
 
 

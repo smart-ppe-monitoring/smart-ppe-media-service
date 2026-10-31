@@ -11,10 +11,12 @@ import { PERMISSIONS } from "../src/common/constants/permission.constant";
 import { EVENT_NAMES } from "../src/common/constants/event.constant";
 import { StorageCleanupSubscriber } from "../src/common/subscribers/storage-cleanup.subscriber";
 import { FileService } from "../src/modules/files/file.service";
+import { R2Service } from "../src/common/services/r2.service";
+import { directImageUploadSchema } from "../src/modules/files/file.validation";
 import { envConfig } from "../src/config/env.config";
 import { z } from "zod";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-19)", { concurrency: false }, () => {
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-22)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -402,6 +404,228 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-19)", { c
       // Verify that envConfig has a valid port number (6379 or environment override)
       assert.ok(typeof envConfig.redis.port === "number");
       assert.ok(envConfig.redis.port > 0);
+    });
+  });
+
+  // ── SEC-20 ───────────────────────────────────────────────────────────────
+  describe("SEC-20: File Ownership Check Explicitly Rejects Null-Actor Deletions on Unassigned Files", () => {
+    test("deleteFile rejects deletion when file.userId is null and caller has no userId (null actor does not own null file)", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unassigned-file-1",
+          userId: null,
+          bucketKey: "system/unassigned.jpg",
+          fileName: "unassigned.jpg",
+          isPublic: false,
+        }),
+        createAuditLog: async () => {},
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await assert.rejects(
+        async () => {
+          await service.deleteFile(
+            "unassigned-file-1",
+            undefined, // Missing/null actor userId
+            [PERMISSIONS.FILE_DELETE],
+          );
+        },
+        (err: any) => {
+          assert.strictEqual(err.statusCode, 403);
+          assert.strictEqual(err.code, ERROR_CODE.FORBIDDEN);
+          return true;
+        },
+      );
+    });
+
+    test("deleteFile rejects deletion when file.userId is null and caller has a valid userId without FILE_MANAGE", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unassigned-file-2",
+          userId: null,
+          bucketKey: "system/unassigned-2.jpg",
+          fileName: "unassigned-2.jpg",
+          isPublic: false,
+        }),
+        createAuditLog: async () => {},
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await assert.rejects(
+        async () => {
+          await service.deleteFile(
+            "unassigned-file-2",
+            "regular-user-123",
+            [PERMISSIONS.FILE_DELETE],
+          );
+        },
+        (err: any) => {
+          assert.strictEqual(err.statusCode, 403);
+          assert.strictEqual(err.code, ERROR_CODE.FORBIDDEN);
+          return true;
+        },
+      );
+    });
+
+    test("deleteFile allows deletion of unassigned file if caller is ADMIN or has FILE_MANAGE", async () => {
+      let deletedId = "";
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unassigned-file-3",
+          userId: null,
+          bucketKey: "system/unassigned-3.jpg",
+          fileName: "unassigned-3.jpg",
+          isPublic: false,
+        }),
+        delete: async (id: string) => {
+          deletedId = id;
+        },
+        createAuditLog: async () => {},
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await service.deleteFile(
+        "unassigned-file-3",
+        "admin-user-999",
+        [],
+        undefined,
+        ROLES.ADMIN,
+      );
+
+      assert.strictEqual(deletedId, "unassigned-file-3", "Admin must be able to delete unassigned file");
+    });
+
+    test("deleteFile allows owner to delete their own file", async () => {
+      let deletedId = "";
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "owner-file-4",
+          userId: "owner-user-777",
+          bucketKey: "images/my-photo.jpg",
+          fileName: "my-photo.jpg",
+          isPublic: false,
+        }),
+        delete: async (id: string) => {
+          deletedId = id;
+        },
+        createAuditLog: async () => {},
+      };
+
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await service.deleteFile(
+        "owner-file-4",
+        "owner-user-777",
+        [PERMISSIONS.FILE_DELETE],
+      );
+
+      assert.strictEqual(deletedId, "owner-file-4", "Owner must be able to delete their own file");
+    });
+  });
+
+  // ── SEC-21 ───────────────────────────────────────────────────────────────
+  describe("SEC-21: R2Service Supports MinIO, Custom S3 Endpoint, and Cloudflare R2 Overrides", () => {
+    test("R2Service connects to MinIO / custom S3 endpoint when explicit endpoint is provided", () => {
+      const minioService = new R2Service({
+        endpoint: "http://localhost:9000",
+        bucketName: "smart-ppe-test-bucket",
+        forcePathStyle: true,
+      });
+
+      assert.strictEqual(minioService.getEndpoint(), "http://localhost:9000");
+      assert.strictEqual(minioService.getBucketName(), "smart-ppe-test-bucket");
+
+      const publicUrl = minioService.getPublicUrl("test-folder/test-image.webp");
+      assert.ok(
+        publicUrl.includes("http://localhost:9000/smart-ppe-test-bucket/test-folder/test-image.webp") ||
+        publicUrl.includes("test-folder/test-image.webp"),
+        "Public URL must contain endpoint or path",
+      );
+    });
+
+    test("envConfig.s3 is configured with standard object storage properties", () => {
+      assert.ok(envConfig.s3, "envConfig.s3 must be defined");
+      assert.strictEqual(typeof envConfig.s3.endpoint, "string");
+      assert.strictEqual(typeof envConfig.s3.region, "string");
+      assert.strictEqual(typeof envConfig.s3.forcePathStyle, "boolean");
+    });
+  });
+
+  // ── SEC-22 ───────────────────────────────────────────────────────────────
+  describe("SEC-22: directImageUploadSchema and uploadAndProcessImage Default isPublic to False (Secure Defaults)", () => {
+    test("directImageUploadSchema defaults isPublic to false", () => {
+      const parsed = directImageUploadSchema.parse({});
+      assert.strictEqual(
+        parsed.isPublic,
+        false,
+        "directImageUploadSchema must default isPublic to false adhering to Least Privilege",
+      );
+    });
+
+    test("directImageUploadSchema accepts explicit isPublic=true string or boolean", () => {
+      const parsedString = directImageUploadSchema.parse({ isPublic: "true" });
+      assert.strictEqual(parsedString.isPublic, true);
+
+      const parsedBool = directImageUploadSchema.parse({ isPublic: true });
+      assert.strictEqual(parsedBool.isPublic, true);
+    });
+
+    test("FileService.uploadAndProcessImage saves isPublic as false when option is not specified", async () => {
+      let createdWithIsPublic: boolean | undefined = undefined;
+
+      const mockRepo: any = {
+        createDirectFile: async (data: any) => {
+          createdWithIsPublic = data.isPublic;
+          return {
+            id: "direct-file-sec22",
+            userId: data.userId,
+            fileName: data.fileName,
+            originalName: data.originalName,
+            mimeType: data.mimeType,
+            size: data.size,
+            bucketKey: data.bucketKey,
+            folder: data.folder,
+            isPublic: data.isPublic,
+            metadata: data.metadata,
+          };
+        },
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        uploadBuffer: async () => {},
+        getPublicUrl: () => undefined,
+      };
+
+      const mockProcessor: any = {
+        processImage: async () => ({
+          buffer: Buffer.from("image-bytes"),
+          info: { format: "webp", width: 400, height: 300, size: 1024, mimeType: "image/webp" },
+        }),
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, mockProcessor);
+
+      await service.uploadAndProcessImage(
+        {
+          buffer: Buffer.from("test-jpg-bytes"),
+          originalname: "site-inspect.jpg",
+          mimetype: "image/jpeg",
+          size: 2000,
+        },
+        {}, // No isPublic specified
+        "user-sec22",
+        [PERMISSIONS.FILE_UPLOAD],
+      );
+
+      assert.strictEqual(
+        createdWithIsPublic,
+        false,
+        "uploadAndProcessImage must default isPublic to false when options.isPublic is omitted",
+      );
     });
   });
 });

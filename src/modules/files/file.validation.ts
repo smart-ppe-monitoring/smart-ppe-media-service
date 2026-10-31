@@ -171,7 +171,7 @@ export const directImageUploadSchema = z.object({
     .transform((v) => v === "true")
     .or(z.boolean())
     .optional()
-    .default(true),
+    .default(false),
   width: z.coerce
     .number()
     .int()
