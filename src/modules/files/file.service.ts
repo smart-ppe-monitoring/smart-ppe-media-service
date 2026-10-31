@@ -5,6 +5,7 @@ import { FileRepository, fileRepository } from "./file.repository";
 import { R2Service } from "../../common/services/r2.service";
 import { AppError } from "../../common/errors/app-error";
 import { ERROR_CODE } from "../../common/errors/error-code";
+import { ROLES } from "../../common/constants/role.constant";
 import { PERMISSIONS } from "../../common/constants/permission.constant";
 import {
   AUDIT_ACTION,
@@ -63,7 +64,18 @@ export class FileService {
   private async resolveEffectivePermissions(
     userId?: string,
     permissions?: string[],
+    role?: string,
   ): Promise<string[]> {
+    // SEC-30: Đồng bộ quyền quản trị viên khi role là ADMIN dù permissions rỗng hoặc dùng wildcard
+    if (role === ROLES.ADMIN || role === "ADMIN") {
+      return [
+        PERMISSIONS.FILE_READ,
+        PERMISSIONS.FILE_UPLOAD,
+        PERMISSIONS.FILE_MANAGE,
+        PERMISSIONS.FILE_DELETE,
+        ...(permissions || []),
+      ];
+    }
     if (permissions && permissions.length > 0) {
       return permissions;
     }
@@ -126,14 +138,18 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     metadata?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<UploadUrlResponseDto> {
-    // Kiểm tra quyền FILE_UPLOAD nếu là người dùng đã đăng nhập
+    // Kiểm tra quyền FILE_UPLOAD nếu là người dùng đã đăng nhập (SEC-30: hỗ trợ vai trò ADMIN)
     if (userId) {
       const userPermissions = await this.resolveEffectivePermissions(
         userId,
         permissions,
+        role,
       );
       const canUpload =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
         userPermissions.includes(PERMISSIONS.FILE_UPLOAD) ||
         userPermissions.includes(PERMISSIONS.FILE_MANAGE);
       if (!canUpload) {
@@ -247,6 +263,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     metadata?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<FileResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -264,8 +281,12 @@ export class FileService {
     const userPermissions = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      userPermissions.includes(PERMISSIONS.FILE_MANAGE);
     // CRIT-01 Fix: File anonymous (userId === null) không được tự động match với caller; chỉ admin (FILE_MANAGE) mới có thể xác nhận
     const isOwner = Boolean(file.userId && userId && file.userId === userId);
 
@@ -328,6 +349,7 @@ export class FileService {
     id: string,
     userId?: string,
     permissions?: string[],
+    role?: string,
   ): Promise<FileResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -346,8 +368,12 @@ export class FileService {
       const userPermissions = await this.resolveEffectivePermissions(
         userId,
         permissions,
+        role,
       );
-      const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+      const canManageAll =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
+        userPermissions.includes(PERMISSIONS.FILE_MANAGE);
       const isOwner = file.userId === userId;
 
       if (!isOwner && !canManageAll) {
@@ -371,6 +397,7 @@ export class FileService {
     id: string,
     userId?: string,
     permissions?: string[],
+    role?: string,
   ): Promise<DownloadUrlResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -397,8 +424,12 @@ export class FileService {
       const userPermissions = await this.resolveEffectivePermissions(
         userId,
         permissions,
+        role,
       );
-      const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+      const canManageAll =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
+        userPermissions.includes(PERMISSIONS.FILE_MANAGE);
       const isOwner = file.userId === userId;
 
       if (!isOwner && !canManageAll) {
@@ -429,12 +460,17 @@ export class FileService {
     query: FileQueryDto,
     userId?: string,
     permissions?: string[],
+    role?: string,
   ) {
     const userPermissions = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      userPermissions.includes(PERMISSIONS.FILE_MANAGE);
 
     const result =
       query.search?.trim() && typeof this.repository.searchFts === "function"
@@ -459,6 +495,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     metadata?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<void> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -468,8 +505,12 @@ export class FileService {
     const userPermissions = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      userPermissions.includes(PERMISSIONS.FILE_MANAGE);
     const isOwner = (file.userId ?? null) === (userId ?? null);
     const hasDeletePermission = userPermissions.includes(
       PERMISSIONS.FILE_DELETE,
@@ -519,12 +560,16 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     context?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<FileResponseDto> {
     const effectivePerms = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
     const canUpload =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
       effectivePerms.includes(PERMISSIONS.FILE_UPLOAD) ||
       effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
 
@@ -632,6 +677,7 @@ export class FileService {
     options: ImageTransformDto = {},
     userId?: string,
     permissions?: string[],
+    role?: string,
   ): Promise<
     | {
         buffer: Buffer;
@@ -654,8 +700,12 @@ export class FileService {
     const effectivePerms = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
     const isOwner = Boolean(file.userId && userId && file.userId === userId);
 
     if (!file.isPublic && !isOwner && !canManageAll) {
@@ -714,6 +764,9 @@ export class FileService {
       }
 
       const canUpload =
+        canManageAll ||
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
         effectivePerms.includes(PERMISSIONS.FILE_UPLOAD) ||
         effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
       if (!canUpload) {
@@ -779,6 +832,15 @@ export class FileService {
     softDeletedRetentionDays = MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS,
     actorContext?: { actorId?: string; ipAddress?: string; userAgent?: string },
   ): Promise<CleanupResultDto> {
+    // SEC-29: Chặn tiêu hủy bằng chứng kiểm toán bằng cách bắt buộc softDeletedRetentionDays tối thiểu 30 ngày
+    if (softDeletedRetentionDays < MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS) {
+      throw new AppError(
+        `Thời gian lưu giữ tệp đã xóa mềm tối thiểu là ${MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS} ngày để bảo vệ bằng chứng kiểm toán`,
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
+    }
+
     const unconfirmedCutoff = new Date(
       Date.now() - unconfirmedMaxAgeHours * 60 * 60 * 1000,
     );

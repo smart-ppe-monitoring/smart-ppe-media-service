@@ -54,10 +54,11 @@ router.post(
   controller.cleanupOrphanFiles,
 );
 
-// 4. Xác nhận đã upload file lên S3/R2 thành công
+// 4. Xác nhận đã upload file lên S3/R2 thành công (yêu cầu quyền FILE_UPLOAD hoặc FILE_MANAGE - SEC-28)
 router.post(
   "/:id/confirm",
   verifyJwtLocally,
+  requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
   validate(fileIdParamSchema, "params"),
   validate(confirmUploadSchema),
   controller.confirmUpload,

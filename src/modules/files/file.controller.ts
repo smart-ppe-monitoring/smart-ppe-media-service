@@ -28,6 +28,7 @@ export class FileController {
           ipAddress: req.ip,
           userAgent: req.headers["user-agent"],
         },
+        req.user?.role,
       );
 
       res.status(201).json({
@@ -49,6 +50,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         { ipAddress: req.ip, userAgent: req.headers["user-agent"] },
+        req.user?.role,
       );
 
       res.json({
@@ -67,6 +69,7 @@ export class FileController {
         req.params.id,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
       );
 
       res.json({
@@ -84,6 +87,7 @@ export class FileController {
         req.params.id,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
       );
 
       res.json({
@@ -101,6 +105,7 @@ export class FileController {
         req.params.id,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
       );
 
       res.redirect(302, result.downloadUrl);
@@ -120,6 +125,7 @@ export class FileController {
         query,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
       );
 
       res.json({
@@ -138,6 +144,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         { ipAddress: req.ip, userAgent: req.headers["user-agent"] },
+        req.user?.role,
       );
 
       res.json({
@@ -171,6 +178,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         { ipAddress: req.ip, userAgent: req.headers["user-agent"] },
+        req.user?.role,
       );
 
       res.status(201).json({
@@ -201,6 +209,7 @@ export class FileController {
         options,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
       );
 
       // Nếu trả về buffer binary trực tiếp

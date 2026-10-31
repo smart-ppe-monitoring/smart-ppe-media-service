@@ -198,15 +198,19 @@ export const cleanupFilesSchema = z.object({
   unconfirmedMaxAgeHours: z.coerce
     .number()
     .int()
-    .positive()
-    .max(720)
+    .positive("Thời gian cho tệp chưa xác nhận phải lớn hơn 0")
+    .max(720, "Thời gian cho tệp chưa xác nhận không được vượt quá 720 giờ")
     .optional()
-    .default(24),
+    .default(MEDIA_LIMITS.UNCONFIRMED_CLEANUP_HOURS),
+  // SEC-29: Giới hạn sàn softDeletedRetentionDays tối thiểu 30 ngày để bảo vệ bằng chứng kiểm toán
   softDeletedRetentionDays: z.coerce
     .number()
     .int()
-    .positive()
-    .max(365)
+    .min(
+      MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS,
+      `Thời gian lưu giữ tệp đã xóa mềm tối thiểu là ${MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS} ngày để bảo vệ bằng chứng kiểm toán`,
+    )
+    .max(365, "Thời gian lưu giữ tệp đã xóa mềm không được vượt quá 365 ngày")
     .optional()
-    .default(30),
+    .default(MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS),
 });

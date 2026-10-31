@@ -30,9 +30,13 @@ import { parseTrustProxy, resolveEncryptionKey } from "../src/config/env.config"
 import { jwtKeyService } from "../src/common/services/jwt-key.service";
 import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
+import { ROLES } from "../src/common/constants/role.constant";
 import { PERMISSIONS } from "../src/common/constants/permission.constant";
 import { MEDIA_LIMITS } from "../src/common/constants/media.constant";
 import { uploadImageMiddleware } from "../src/middlewares/upload.middleware";
+import { requireAnyPermission } from "../src/middlewares/permission.middleware";
+import fileRouter from "../src/modules/files/file.route";
+import { cleanupFilesSchema } from "../src/modules/files/file.validation";
 import {
   startOutboxRelay,
   stopOutboxRelay,
@@ -41,7 +45,7 @@ import {
 } from "../src/server";
 import { eventBus } from "../src/common/services/event-bus.service";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-27)", { concurrency: false }, () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-30)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -686,6 +690,193 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-27)", { c
       } finally {
         process.env = { ...originalEnv };
       }
+    });
+  });
+
+  describe("SEC-28: Confirm Upload Route Mounts Permission Guard", () => {
+    test("verifies POST /:id/confirm route is registered with permission middleware", () => {
+      const confirmLayer = (fileRouter as any).stack.find(
+        (l: any) => l.route && l.route.path === "/:id/confirm" && l.route.methods.post,
+      );
+      assert.ok(confirmLayer, "Route POST /:id/confirm must be defined");
+      assert.ok(
+        confirmLayer.route.stack.length >= 5,
+        `Expected at least 5 middleware handlers, got ${confirmLayer.route.stack.length}`,
+      );
+    });
+
+    test("requireAnyPermission(FILE_UPLOAD, FILE_MANAGE) blocks user without required permissions", () => {
+      const middleware = requireAnyPermission(
+        PERMISSIONS.FILE_UPLOAD,
+        PERMISSIONS.FILE_MANAGE,
+      );
+      const req: any = {
+        user: { id: "user-1", role: ROLES.USER, permissions: [] },
+      };
+      let caughtError: any;
+      middleware(req, {} as any, (err?: any) => {
+        caughtError = err;
+      });
+      assert.ok(caughtError instanceof AppError);
+      assert.strictEqual(caughtError.statusCode, 403);
+      assert.strictEqual(caughtError.code, ERROR_CODE.FORBIDDEN);
+    });
+
+    test("requireAnyPermission(FILE_UPLOAD, FILE_MANAGE) permits user with FILE_UPLOAD", () => {
+      const middleware = requireAnyPermission(
+        PERMISSIONS.FILE_UPLOAD,
+        PERMISSIONS.FILE_MANAGE,
+      );
+      const req: any = {
+        user: { id: "user-1", role: ROLES.USER, permissions: [PERMISSIONS.FILE_UPLOAD] },
+      };
+      let nextCalled = false;
+      middleware(req, {} as any, (err?: any) => {
+        assert.strictEqual(err, undefined);
+        nextCalled = true;
+      });
+      assert.strictEqual(nextCalled, true);
+    });
+  });
+
+  describe("SEC-29: Orphan File Cleanup Schema & Service Enforce Retention Lower Bound", () => {
+    test("cleanupFilesSchema rejects softDeletedRetentionDays < 30 (e.g. 1 or 29)", () => {
+      const parsed1 = cleanupFilesSchema.safeParse({ softDeletedRetentionDays: 1 });
+      assert.strictEqual(parsed1.success, false);
+      if (!parsed1.success) {
+        assert.ok(parsed1.error.issues.some((i) => i.path.includes("softDeletedRetentionDays")));
+      }
+
+      const parsed29 = cleanupFilesSchema.safeParse({ softDeletedRetentionDays: 29 });
+      assert.strictEqual(parsed29.success, false);
+    });
+
+    test("cleanupFilesSchema accepts default or softDeletedRetentionDays >= 30", () => {
+      const parsedDefault = cleanupFilesSchema.safeParse({});
+      assert.strictEqual(parsedDefault.success, true);
+      if (parsedDefault.success) {
+        assert.strictEqual(parsedDefault.data.softDeletedRetentionDays, 30);
+        assert.strictEqual(parsedDefault.data.unconfirmedMaxAgeHours, 24);
+      }
+
+      const parsed60 = cleanupFilesSchema.safeParse({ softDeletedRetentionDays: 60 });
+      assert.strictEqual(parsed60.success, true);
+    });
+
+    test("FileService.cleanupOrphanFiles throws AppError if softDeletedRetentionDays < 30", async () => {
+      const service = new FileService({} as any, {} as any, {} as any, {} as any);
+      await assert.rejects(
+        async () => {
+          await service.cleanupOrphanFiles(24, 10);
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.VALIDATION_ERROR);
+          assert.ok(err.message.includes("tối thiểu là 30 ngày"));
+          return true;
+        },
+      );
+    });
+  });
+
+  describe("SEC-30: Role and Permission Synchronization Between Controller and Service", () => {
+    test("Administrator with role ADMIN and empty permissions array can access private file owned by another user", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "file-private-1",
+          userId: "other-user-99",
+          isPublic: false,
+          bucketKey: "private/other/doc.pdf",
+        }),
+      };
+      const mockR2: any = {
+        getPublicUrl: () => "https://r2/doc.pdf",
+      };
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+
+      // Admin caller with role ADMIN and empty permissions
+      const file = await service.getFileById(
+        "file-private-1",
+        "admin-user-id",
+        [],
+        ROLES.ADMIN,
+      );
+      assert.strictEqual(file.id, "file-private-1");
+      assert.strictEqual(file.userId, "other-user-99");
+    });
+
+    test("Regular user without FILE_MANAGE cannot access private file owned by another user", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "file-private-2",
+          userId: "other-user-99",
+          isPublic: false,
+          bucketKey: "private/other/doc.pdf",
+        }),
+      };
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await assert.rejects(
+        async () => {
+          await service.getFileById(
+            "file-private-2",
+            "normal-user-id",
+            [],
+            ROLES.USER,
+          );
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 403);
+          assert.strictEqual(err.code, ERROR_CODE.FORBIDDEN);
+          return true;
+        },
+      );
+    });
+
+    test("Administrator with role ADMIN and empty permissions can delete any file", async () => {
+      let deletedId = "";
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "file-del-1",
+          userId: "other-user-99",
+          bucketKey: "files/other.pdf",
+          fileName: "other.pdf",
+        }),
+        delete: async (id: string) => {
+          deletedId = id;
+          return { id };
+        },
+        createAuditLog: async () => {},
+      };
+      const mockR2: any = {
+        deleteFile: async () => {},
+      };
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+
+      await service.deleteFile(
+        "file-del-1",
+        "admin-user-id",
+        [],
+        undefined,
+        ROLES.ADMIN,
+      );
+      assert.strictEqual(deletedId, "file-del-1");
+    });
+
+    test("Administrator with role ADMIN and empty permissions can list all files without ownership restriction", async () => {
+      let passedCanManageAll: boolean | undefined;
+      const mockRepo: any = {
+        findAll: async (_query: any, _userId: any, canManageAll: boolean) => {
+          passedCanManageAll = canManageAll;
+          return { data: [], meta: { total: 0, page: 1, limit: 10 } };
+        },
+      };
+      const service = new FileService(mockRepo, {} as any, {} as any, {} as any);
+
+      await service.listFiles({}, "admin-id", [], ROLES.ADMIN);
+      assert.strictEqual(passedCanManageAll, true);
     });
   });
 });
