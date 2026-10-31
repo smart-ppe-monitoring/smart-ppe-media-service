@@ -87,12 +87,23 @@ export class EventBusService {
   private outboxRepo: OutboxRepository;
   private isProcessingInMemory = false;
 
-  constructor(outboxRepo?: OutboxRepository) {
+  constructor(outboxRepo?: OutboxRepository, redisConnection?: IORedis) {
     this.outboxRepo = outboxRepo || outboxRepository;
 
-    if (!isTestEnv && envConfig.redis.enabled) {
+    if (redisConnection) {
+      this.redisConnection = redisConnection;
+      this.isRedisAvailable = true;
+    } else if (!isTestEnv && envConfig.redis.enabled) {
       this.initRedis();
     }
+  }
+
+  public setRedisConnectionForTesting(
+    client: IORedis | any | undefined,
+    isAvailable = true,
+  ): void {
+    this.redisConnection = client;
+    this.isRedisAvailable = Boolean(client && isAvailable);
   }
 
   private initRedis(): void {
@@ -320,8 +331,8 @@ export class EventBusService {
    * Xử lý sự kiện trực tiếp tới các consumers kèm bảo vệ Idempotent Consumer
    */
   public async dispatchDirectly(envelope: EventEnvelope): Promise<void> {
-    // 1. Kiểm tra tính Idempotent: Nếu eventId đã được xử lý trong vòng 24h thì bỏ qua
-    if (this.isEventAlreadyProcessed(envelope.id)) {
+    // 1. Kiểm tra tính Idempotent: Nếu eventId đã được xử lý trong vòng 24h thì bỏ qua (SEC-50)
+    if (await this.isEventAlreadyProcessed(envelope.id)) {
       console.log(
         `[EventBus] ⏭️ Duplicate event ${envelope.id} skipped (Idempotent protection)`,
       );
@@ -331,7 +342,7 @@ export class EventBusService {
     const handlers = this.handlers.get(envelope.name);
     if (!handlers || handlers.size === 0) {
       // Không có consumer đăng ký cho topic này
-      this.markEventProcessed(envelope.id);
+      await this.markEventProcessed(envelope.id);
       return;
     }
 
@@ -353,13 +364,27 @@ export class EventBusService {
     );
 
     // 3. Đánh dấu đã xử lý thành công
-    this.markEventProcessed(envelope.id);
+    await this.markEventProcessed(envelope.id);
   }
 
   /**
    * Kiểm tra xem sự kiện đã từng được xử lý chưa (Idempotency Check)
+   * Kết hợp Redis phân tán (multi-pod / replicas) và In-Memory cache fallback (SEC-50).
    */
-  public isEventAlreadyProcessed(eventId: string): boolean {
+  public async isEventAlreadyProcessed(eventId: string): Promise<boolean> {
+    // 1. Kiểm tra Redis phân tán cho cụm multi-pod / replicas (SEC-50)
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const cached = await this.redisConnection.get(
+          `idempotency:event:${eventId}`,
+        );
+        if (cached) return true;
+      } catch {
+        // Fallback sang in-memory nếu Redis trục trặc
+      }
+    }
+
+    // 2. Fallback sang In-Memory Cache
     const expiresAt = this.processedEventIds.get(eventId);
     if (!expiresAt) return false;
     if (Date.now() > expiresAt) {
@@ -369,8 +394,30 @@ export class EventBusService {
     return true;
   }
 
-  public markEventProcessed(eventId: string): void {
-    // Giới hạn bộ nhớ đệm tối đa 10.000 events
+  /**
+   * Đánh dấu sự kiện đã được xử lý (Idempotency Record - SEC-50)
+   * Sử dụng SET EX trên Redis phân tán và đồng bộ vào bộ nhớ đệm cục bộ.
+   */
+  public async markEventProcessed(eventId: string): Promise<void> {
+    // 1. Ghi nhận vào Redis phân tán với TTL 24 giờ (SEC-50)
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const ttlSec = Math.max(
+          1,
+          Math.floor(EVENT_BUS_CONSTANTS.IDEMPOTENCY_TTL_MS / 1000),
+        );
+        await this.redisConnection.set(
+          `idempotency:event:${eventId}`,
+          "1",
+          "EX",
+          ttlSec,
+        );
+      } catch {
+        // Fallback
+      }
+    }
+
+    // 2. Ghi nhận vào In-Memory Cache
     if (this.processedEventIds.size >= 10000) {
       const now = Date.now();
       for (const [k, exp] of this.processedEventIds.entries()) {
@@ -386,6 +433,41 @@ export class EventBusService {
       eventId,
       Date.now() + EVENT_BUS_CONSTANTS.IDEMPOTENCY_TTL_MS,
     );
+  }
+
+  /**
+   * Nguyên tử hóa kiểm tra và ghi nhận sự kiện qua Redis SET NX EX (Atomic Idempotent Claim - SEC-50).
+   * Trả về true nếu sự kiện là mới (khóa thành công), false nếu sự kiện đã tồn tại (duplicate).
+   */
+  public async tryAcquireEventLock(
+    eventId: string,
+    ttlMs: number = EVENT_BUS_CONSTANTS.IDEMPOTENCY_TTL_MS,
+  ): Promise<boolean> {
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const ttlSec = Math.max(1, Math.floor(ttlMs / 1000));
+        const res = await this.redisConnection.set(
+          `idempotency:event:${eventId}`,
+          "1",
+          "EX",
+          ttlSec,
+          "NX",
+        );
+        if (res === "OK") {
+          this.processedEventIds.set(eventId, Date.now() + ttlMs);
+          return true;
+        }
+        return false;
+      } catch {
+        // Fallback sang in-memory
+      }
+    }
+
+    if (await this.isEventAlreadyProcessed(eventId)) {
+      return false;
+    }
+    await this.markEventProcessed(eventId);
+    return true;
   }
 
   /**
@@ -577,8 +659,18 @@ export class EventBusService {
     this.dlqEvents = [];
   }
 
-  public clearProcessedCache(): void {
+  public async clearProcessedCache(): Promise<void> {
     this.processedEventIds.clear();
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const keys = await this.redisConnection.keys("idempotency:event:*");
+        if (keys && keys.length > 0) {
+          await this.redisConnection.del(...keys);
+        }
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   public getSubscriberCount(eventName: string): number {

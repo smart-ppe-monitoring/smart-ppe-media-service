@@ -47,9 +47,14 @@ import {
   handleMediaShutdown,
   resetShutdownStateForTesting,
 } from "../src/server";
+import {
+  errorMiddleware,
+  maskSensitiveCredentials,
+  sanitizeErrorForLogging,
+} from "../src/middlewares/error.middleware";
 import { eventBus, SENSITIVE_OUTBOX_FIELDS } from "../src/common/services/event-bus.service";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-48)", { concurrency: false }, () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-50)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -1407,6 +1412,211 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-48)", { c
 
       assert.strictEqual(result.unconfirmedCleaned, 0);
       assert.strictEqual(hardDeleteCalled, false, "hardDeleteMany must NOT be called when R2 batch deletion fails");
+    });
+  });
+
+  describe("SEC-49: Unhandled Error Credential Masking and Log Sanitization", () => {
+    test("maskSensitiveCredentials masks database connection strings and passwords", () => {
+      const postgresErr =
+        "Can't reach database server at postgresql://media_user:SuperSecretP@ssword123!@localhost:5433/ppe_media_db";
+      const masked = maskSensitiveCredentials(postgresErr);
+      assert.ok(!masked.includes("SuperSecretP@ssword123!"));
+      assert.ok(masked.includes("postgresql://media_user:***@localhost:5433/ppe_media_db"));
+
+      const redisErr = "Redis auth error on redis://:RedisTopSecretKey@redis-server:6379/0";
+      const maskedRedis = maskSensitiveCredentials(redisErr);
+      assert.ok(!maskedRedis.includes("RedisTopSecretKey"));
+      assert.ok(maskedRedis.includes("redis://:***@redis-server:6379/0"));
+    });
+
+    test("maskSensitiveCredentials masks AWS S3 presigned signatures and tokens", () => {
+      const s3Url =
+        "https://r2.cloudflarestorage.com/ppe-bucket/photo.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20261101/auto/s3/aws4_request&X-Amz-Signature=d2c88f1234567890abcdef&X-Amz-Security-Token=AQoDYXdzEJr...";
+      const masked = maskSensitiveCredentials(s3Url);
+      assert.ok(!masked.includes("d2c88f1234567890abcdef"));
+      assert.ok(!masked.includes("AKIAIOSFODNN7EXAMPLE"));
+      assert.ok(masked.includes("X-Amz-Signature=***"));
+      assert.ok(masked.includes("X-Amz-Credential=***"));
+      assert.ok(masked.includes("X-Amz-Security-Token=***"));
+    });
+
+    test("maskSensitiveCredentials masks Bearer tokens and sensitive key-value pairs", () => {
+      const logText =
+        'Failed auth with Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc and secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" and password: "SecretPassword"';
+      const masked = maskSensitiveCredentials(logText);
+      assert.ok(!masked.includes("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"));
+      assert.ok(!masked.includes("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+      assert.ok(!masked.includes("SecretPassword"));
+      assert.ok(masked.includes("Bearer ***"));
+      assert.ok(masked.includes('secretAccessKey: "***"'));
+      assert.ok(masked.includes('password: "***"'));
+    });
+
+    test("sanitizeErrorForLogging returns structured error with masked message and stack", () => {
+      const rawError = new Error(
+        "PrismaClientInitializationError: Connection error postgresql://media_admin:MyP@ssw0rd!@127.0.0.1:5433/ppe_media_db",
+      );
+      rawError.stack =
+        "Error: Connection error postgresql://media_admin:MyP@ssw0rd!@127.0.0.1:5433/ppe_media_db\n    at PrismaClient.connect (/app/db.ts:12:15)";
+
+      const sanitized = sanitizeErrorForLogging(rawError);
+      assert.strictEqual(sanitized.name, "Error");
+      assert.ok(!sanitized.message.includes("MyP@ssw0rd!"));
+      assert.ok(sanitized.message.includes("postgresql://media_admin:***@127.0.0.1:5433/ppe_media_db"));
+      assert.ok(sanitized.stack);
+      assert.ok(!sanitized.stack.includes("MyP@ssw0rd!"));
+      assert.ok(sanitized.stack.includes("postgresql://media_admin:***@127.0.0.1:5433/ppe_media_db"));
+    });
+
+    test("errorMiddleware masks credentials when logging unhandled error to console.error", () => {
+      const loggedArgs: any[] = [];
+      const origConsoleError = console.error;
+      console.error = (...args: any[]) => {
+        loggedArgs.push(args);
+      };
+
+      try {
+        const sensitiveError = new Error(
+          "AWS CredentialsProviderError: accessKeyId: AKIAIOSFODNN7EXAMPLE, secretAccessKey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
+        const req: any = {
+          headers: { "x-request-id": "req-safe-123" },
+        };
+        const res: any = {
+          statusCode: 200,
+          status(code: number) {
+            this.statusCode = code;
+            return this;
+          },
+          json(body: any) {
+            this.body = body;
+            return this;
+          },
+        };
+
+        errorMiddleware(sensitiveError, req, res, () => {});
+
+        assert.strictEqual(res.statusCode, 500);
+        assert.strictEqual(res.body.code, ERROR_CODE.INTERNAL_SERVER_ERROR);
+        assert.strictEqual(loggedArgs.length, 1);
+
+        const logOutput = JSON.stringify(loggedArgs[0]);
+        assert.ok(!logOutput.includes("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+        assert.ok(logOutput.includes("secretAccessKey"));
+      } finally {
+        console.error = origConsoleError;
+      }
+    });
+  });
+
+  describe("SEC-50: Distributed Event Deduplication via Redis SET NX EX and Multi-Pod Idempotency", () => {
+    test("tryAcquireEventLock uses Redis SET NX EX and prevents duplicate execution across replicas", async () => {
+      const redisStore = new Map<string, string>();
+      const mockRedis: any = {
+        set: async (key: string, val: string, exFlag: string, ttl: number, nxFlag?: string) => {
+          if (nxFlag === "NX" && redisStore.has(key)) {
+            return null; // Key already exists -> NX fails
+          }
+          redisStore.set(key, val);
+          return "OK";
+        },
+        get: async (key: string) => redisStore.get(key) || null,
+        del: async (...keys: string[]) => {
+          for (const k of keys) redisStore.delete(k);
+          return keys.length;
+        },
+        keys: async (pattern: string) => Array.from(redisStore.keys()),
+      };
+
+      const originalRedis = (eventBus as any).redisConnection;
+      const originalAvailable = (eventBus as any).isRedisAvailable;
+
+      try {
+        (eventBus as any).setRedisConnectionForTesting(mockRedis, true);
+
+        // First attempt for event 'evt-uuid-1' must acquire lock successfully
+        const firstAttempt = await eventBus.tryAcquireEventLock("evt-uuid-1", 60000);
+        assert.strictEqual(firstAttempt, true, "First event delivery must acquire lock");
+
+        // Second attempt for the same event ID across any pod must be rejected as duplicate
+        const secondAttempt = await eventBus.tryAcquireEventLock("evt-uuid-1", 60000);
+        assert.strictEqual(secondAttempt, false, "Second event delivery must be rejected as duplicate");
+
+        // Verify isEventAlreadyProcessed queries Redis key
+        const isProcessed = await eventBus.isEventAlreadyProcessed("evt-uuid-1");
+        assert.strictEqual(isProcessed, true, "isEventAlreadyProcessed must confirm key in Redis");
+
+        // Verify clearProcessedCache clears keys from Redis
+        await eventBus.clearProcessedCache();
+        const afterClear = await eventBus.isEventAlreadyProcessed("evt-uuid-1");
+        assert.strictEqual(afterClear, false, "Cache clear must remove Redis idempotency keys");
+      } finally {
+        (eventBus as any).setRedisConnectionForTesting(originalRedis, originalAvailable);
+      }
+    });
+
+    test("dispatchDirectly skips duplicate execution when event is already recorded in Redis", async () => {
+      const redisStore = new Map<string, string>();
+      redisStore.set("idempotency:event:evt-dup-999", "1"); // Already processed by another replica
+
+      const mockRedis: any = {
+        get: async (key: string) => redisStore.get(key) || null,
+        set: async (key: string, val: string) => {
+          redisStore.set(key, val);
+          return "OK";
+        },
+        del: async (...keys: string[]) => {
+          for (const k of keys) redisStore.delete(k);
+          return keys.length;
+        },
+        keys: async () => Array.from(redisStore.keys()),
+      };
+
+      let handlerCalled = false;
+      const originalRedis = (eventBus as any).redisConnection;
+      const originalAvailable = (eventBus as any).isRedisAvailable;
+      let unsubscribe: (() => void) | undefined;
+
+      try {
+        (eventBus as any).setRedisConnectionForTesting(mockRedis, true);
+        unsubscribe = (eventBus as any).subscribe(EVENT_NAMES.FILE_DELETED, async () => {
+          handlerCalled = true;
+        });
+
+        await eventBus.dispatchDirectly({
+          id: "evt-dup-999",
+          name: EVENT_NAMES.FILE_DELETED,
+          timestamp: Date.now(),
+          source: "smart-ppe-media-service",
+          payload: { fileId: "f-1" },
+        } as any);
+
+        assert.strictEqual(handlerCalled, false, "Handler must NOT be executed for duplicate event from Redis");
+      } finally {
+        if (unsubscribe) unsubscribe();
+        (eventBus as any).setRedisConnectionForTesting(originalRedis, originalAvailable);
+        await eventBus.clearProcessedCache();
+      }
+    });
+
+    test("isEventAlreadyProcessed falls back safely to in-memory cache when Redis is unavailable", async () => {
+      const originalRedis = (eventBus as any).redisConnection;
+      const originalAvailable = (eventBus as any).isRedisAvailable;
+
+      try {
+        (eventBus as any).setRedisConnectionForTesting(undefined, false);
+        await eventBus.clearProcessedCache();
+
+        const notProcessed = await eventBus.isEventAlreadyProcessed("inmem-evt-1");
+        assert.strictEqual(notProcessed, false);
+
+        await eventBus.markEventProcessed("inmem-evt-1");
+        const processed = await eventBus.isEventAlreadyProcessed("inmem-evt-1");
+        assert.strictEqual(processed, true);
+      } finally {
+        (eventBus as any).setRedisConnectionForTesting(originalRedis, originalAvailable);
+        await eventBus.clearProcessedCache();
+      }
     });
   });
 });

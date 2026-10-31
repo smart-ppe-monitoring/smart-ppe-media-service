@@ -20,6 +20,58 @@ export function notFoundMiddleware(
   );
 }
 
+/**
+ * Khử bỏ các chuỗi dữ liệu nhạy cảm (mật khẩu CSDL, AWS S3 secret keys, Bearer tokens - SEC-49)
+ * khỏi các thông báo lỗi và stack trace trước khi ghi ra stdout/stderr container logs.
+ */
+export function maskSensitiveCredentials(text: string): string {
+  if (!text || typeof text !== "string") return text;
+  return text
+    // 1. Mask chuỗi kết nối CSDL (PostgreSQL, Redis, MongoDB)
+    .replace(/(postgres(?:ql)?:\/\/[^:\s@]+:).+?(@[^@\s\/]+(?::\d+)?(?:[/?\s]|$))/gi, "$1***$2")
+    .replace(/(redis(?:s)?:\/\/(?:[^:\s@]*:)?).+?(@[^@\s\/]+(?::\d+)?(?:[/?\s]|$))/gi, "$1***$2")
+    .replace(/(mongodb(?:\+srv)?:\/\/[^:\s@]+:).+?(@[^@\s\/]+(?::\d+)?(?:[/?\s]|$))/gi, "$1***$2")
+    // 2. Mask AWS S3 Presigned parameters
+    .replace(/X-Amz-Signature=[a-fA-F0-9]+/gi, "X-Amz-Signature=***")
+    .replace(/X-Amz-Credential=[^&\s"']+/gi, "X-Amz-Credential=***")
+    .replace(/X-Amz-Security-Token=[^&\s"']+/gi, "X-Amz-Security-Token=***")
+    // 3. Mask Authorization Bearer tokens
+    .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, "Bearer ***")
+    // 4. Mask các trường JSON hoặc chuỗi cấu hình chứa bí mật
+    .replace(
+      /((?:password|secret|secretAccessKey|accessKeyId|sessionToken|apiKey|api_key|token|privateKey)\s*[:=]\s*["']?)[^\s"',;]{4,}(["']?)/gi,
+      "$1***$2",
+    );
+}
+
+/**
+ * Chuẩn hóa và làm sạch đối tượng Error phục vụ ghi log an toàn (SEC-49)
+ */
+export function sanitizeErrorForLogging(error: any): {
+  name: string;
+  message: string;
+  code?: string | number;
+  stack?: string;
+} {
+  if (!error) {
+    return { name: "UnknownError", message: "Unknown error occurred" };
+  }
+  const name = error.name || "Error";
+  const rawMessage =
+    typeof error.message === "string" ? error.message : String(error);
+  const sanitizedMessage = maskSensitiveCredentials(rawMessage);
+  const sanitizedStack = error.stack
+    ? maskSensitiveCredentials(error.stack)
+    : undefined;
+
+  return {
+    name,
+    message: sanitizedMessage,
+    code: error.code,
+    ...(sanitizedStack ? { stack: sanitizedStack } : {}),
+  };
+}
+
 export function errorMiddleware(
   error: Error,
   req: Request,
@@ -139,7 +191,10 @@ export function errorMiddleware(
     rawRequestId && /^[a-zA-Z0-9_-]{1,64}$/.test(rawRequestId)
       ? rawRequestId
       : req.id || "no-request-id";
-  console.error(`[Unhandled Error][Request-ID: ${requestId}]`, error);
+
+  // SEC-49: Làm sạch thông tin nhạy cảm (mật khẩu CSDL, khóa bí mật AWS) trước khi in ra console
+  const sanitizedError = sanitizeErrorForLogging(error);
+  console.error(`[Unhandled Error][Request-ID: ${requestId}]`, sanitizedError);
 
   res.status(500).json({
     success: false,
@@ -147,3 +202,5 @@ export function errorMiddleware(
     code: ERROR_CODE.INTERNAL_SERVER_ERROR,
   });
 }
+
+export const errorHandler = errorMiddleware;
