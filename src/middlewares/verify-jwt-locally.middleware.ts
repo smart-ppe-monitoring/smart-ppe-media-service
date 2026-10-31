@@ -341,7 +341,7 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
 
         if (payload.purpose === JWT_PURPOSE.SSE_STREAM_TICKET) {
           req.user = {
-            id: payload.id,
+            id: (payload as any).sub || payload.id || (payload as any).userId,
             email: payload.email,
             role: payload.role as any,
             roleId: payload.roleId,
@@ -444,9 +444,11 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
         );
       }
 
-      // 6. Gán context user cho microservice hiện tại
+      // 6. Gán context user cho microservice hiện tại (SEC-46: Tuân thủ RFC 7519 trích xuất sub claim)
+      const resolvedUserId =
+        (payload as any).sub || payload.id || (payload as any).userId;
       req.user = {
-        id: payload.id,
+        id: resolvedUserId,
         email: payload.email,
         role: payload.role as any,
         roleId: payload.roleId,

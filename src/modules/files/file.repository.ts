@@ -31,24 +31,30 @@ const fileSelect = {
 export const FILE_RECORDS_FTS_VECTOR_EXPR = Prisma.sql`to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, ''))`;
 
 export class FileRepository {
-  create(data: {
+  private db: any;
+
+  constructor(dbClient: any = prisma) {
+    this.db = dbClient;
+  }
+
+  async create(data: {
     userId?: string | null;
     originalName: string;
     fileName: string;
     mimeType: string;
-    size?: number;
+    size?: number | bigint;
     bucketKey: string;
     folder?: string;
     isPublic?: boolean;
     metadata?: Prisma.InputJsonValue;
   }) {
-    return prisma.fileRecord.create({
+    const record = await this.db.fileRecord.create({
       data: {
         userId: data.userId,
         originalName: data.originalName,
         fileName: data.fileName,
         mimeType: data.mimeType,
-        size: data.size ?? 0,
+        size: data.size !== undefined ? BigInt(data.size) : BigInt(0),
         bucketKey: data.bucketKey,
         folder: data.folder ?? "general",
         isPublic: data.isPublic ?? false,
@@ -57,31 +63,35 @@ export class FileRepository {
       },
       select: fileSelect,
     });
+    return { ...record, size: Number(record.size) };
   }
 
-  findById(id: string) {
-    return prisma.fileRecord.findFirst({
+  async findById(id: string) {
+    const record = await this.db.fileRecord.findFirst({
       where: { id, deletedAt: null },
       select: fileSelect,
     });
+    return record ? { ...record, size: Number(record.size) } : null;
   }
 
-  findByBucketKey(bucketKey: string) {
-    return prisma.fileRecord.findUnique({
+  async findByBucketKey(bucketKey: string) {
+    const record = await this.db.fileRecord.findUnique({
       where: { bucketKey },
       select: fileSelect,
     });
+    return record ? { ...record, size: Number(record.size) } : null;
   }
 
-  confirmUpload(id: string, size?: number) {
-    return prisma.fileRecord.update({
+  async confirmUpload(id: string, size?: number | bigint) {
+    const updated = await this.db.fileRecord.update({
       where: { id },
       data: {
         isConfirmed: true,
-        ...(size !== undefined ? { size } : {}),
+        ...(size !== undefined ? { size: BigInt(size) } : {}),
       },
       select: fileSelect,
     });
+    return { ...updated, size: Number(updated.size) };
   }
 
   async findAll(
@@ -163,8 +173,13 @@ export class FileRepository {
       prisma.fileRecord.count({ where }),
     ]);
 
+    const mappedData = data.map((f) => ({
+      ...f,
+      size: Number(f.size),
+    }));
+
     return {
-      data,
+      data: mappedData,
       meta: formatPaginationMeta(safePage, safeLimit, total),
     };
   }
@@ -337,24 +352,24 @@ export class FileRepository {
     });
   }
 
-  createDirectFile(data: {
+  async createDirectFile(data: {
     userId?: string | null;
     originalName: string;
     fileName: string;
     mimeType: string;
-    size: number;
+    size: number | bigint;
     bucketKey: string;
     folder?: string;
     isPublic?: boolean;
     metadata?: Prisma.InputJsonValue;
   }) {
-    return prisma.fileRecord.create({
+    const record = await this.db.fileRecord.create({
       data: {
         userId: data.userId,
         originalName: data.originalName,
         fileName: data.fileName,
         mimeType: data.mimeType,
-        size: data.size,
+        size: BigInt(data.size),
         bucketKey: data.bucketKey,
         folder: data.folder ?? "general",
         isPublic: data.isPublic ?? false,
@@ -363,6 +378,7 @@ export class FileRepository {
       },
       select: fileSelect,
     });
+    return { ...record, size: Number(record.size) };
   }
 
   findUnconfirmedOlderThan(cutoff: Date, limit = 100) {

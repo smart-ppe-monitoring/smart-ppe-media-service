@@ -157,6 +157,7 @@ export class R2Service {
 
   /**
    * Xóa hàng loạt file khỏi R2 theo batch (tối đa 1000 files/lần gọi theo chuẩn S3).
+   * Kiểm tra và bắt buộc xử lý lỗi response.Errors để chống rò rỉ blobs mồ côi (SEC-48).
    * @param keys Danh sách đường dẫn file trong bucket
    */
   async deleteFiles(keys: string[]): Promise<void> {
@@ -171,7 +172,18 @@ export class R2Service {
           Quiet: true,
         },
       });
-      await this.client.send(command);
+      const response = await this.client.send(command);
+      if (response.Errors && response.Errors.length > 0) {
+        const errorDetails = response.Errors.map(
+          (err) =>
+            `${err.Key ?? "unknown"}: ${err.Code ?? "Unknown"} (${err.Message ?? ""})`,
+        ).join(", ");
+        throw new AppError(
+          `S3 batch deletion partial failure (${response.Errors.length} objects failed): ${errorDetails}`,
+          500,
+          ERROR_CODE.INTERNAL_SERVER_ERROR,
+        );
+      }
     }
   }
 

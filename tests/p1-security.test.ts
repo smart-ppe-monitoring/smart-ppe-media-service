@@ -28,6 +28,8 @@ import {
 import { getMasterKeyBuffer } from "../src/common/helpers/crypto.helper";
 import { parseTrustProxy, resolveEncryptionKey } from "../src/config/env.config";
 import { jwtKeyService } from "../src/common/services/jwt-key.service";
+import { jwtConfig } from "../src/config/jwt.config";
+import { JWT_PURPOSE } from "../src/common/constants/jwt.constant";
 import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
 import { ROLES } from "../src/common/constants/role.constant";
@@ -45,9 +47,9 @@ import {
   handleMediaShutdown,
   resetShutdownStateForTesting,
 } from "../src/server";
-import { eventBus } from "../src/common/services/event-bus.service";
+import { eventBus, SENSITIVE_OUTBOX_FIELDS } from "../src/common/services/event-bus.service";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-41)", { concurrency: false }, () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-48)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -1137,6 +1139,274 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-41)", { c
         "r2DeleteFiles:orphans/unconfirmed-1.bin",
         "hardDeleteMany:unconfirmed-1",
       ]);
+    });
+  });
+
+  describe("SEC-45: 64-Bit BigInt Storage and Safe JSON Serialization for Large Media Files", () => {
+    test("BigInt.prototype.toJSON safely serializes BigInt to Number in JSON.stringify", () => {
+      const largeFilePayload = {
+        id: "media-video-1",
+        size: BigInt(5368709120), // 5GB > 2.14GB 32-bit limit
+      };
+      const jsonStr = JSON.stringify(largeFilePayload);
+      const parsed = JSON.parse(jsonStr);
+      assert.strictEqual(parsed.size, 5368709120);
+      assert.strictEqual(typeof parsed.size, "number");
+    });
+
+    test("FileRepository maps Prisma BigInt size to Number to preserve API compatibility", async () => {
+      const mockPrismaFileRecord = {
+        create: async (args: any) => ({
+          id: "record-1",
+          userId: args.data.userId,
+          originalName: args.data.originalName,
+          fileName: args.data.fileName,
+          mimeType: args.data.mimeType,
+          size: args.data.size,
+          bucketKey: args.data.bucketKey,
+          folder: args.data.folder,
+          isPublic: args.data.isPublic,
+          isConfirmed: false,
+          checksum: null,
+          metadata: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          deletedAt: null,
+        }),
+        findFirst: async () => ({
+          id: "record-1",
+          originalName: "large_cctv.mp4",
+          fileName: "large_cctv.mp4",
+          mimeType: "video/mp4",
+          size: BigInt(5368709120),
+          bucketKey: "videos/large_cctv.mp4",
+          folder: "videos",
+          isPublic: false,
+          isConfirmed: true,
+          userId: "user-1",
+          checksum: null,
+          metadata: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          deletedAt: null,
+        }),
+        update: async (args: any) => ({
+          id: args.where.id,
+          originalName: "large_cctv.mp4",
+          fileName: "large_cctv.mp4",
+          mimeType: "video/mp4",
+          size: args.data.size ?? BigInt(0),
+          bucketKey: "videos/large_cctv.mp4",
+          folder: "videos",
+          isPublic: false,
+          isConfirmed: true,
+          userId: "user-1",
+          checksum: null,
+          metadata: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          deletedAt: null,
+        }),
+      };
+
+      const repo = new FileRepository({ fileRecord: mockPrismaFileRecord } as any);
+      // Test repository handles BigInt size and returns Number
+      const created = await repo.create({
+        originalName: "large_cctv.mp4",
+        fileName: "large_cctv.mp4",
+        mimeType: "video/mp4",
+        size: 5368709120,
+        bucketKey: "videos/large_cctv.mp4",
+      });
+      assert.strictEqual(created.size, 5368709120);
+      assert.strictEqual(typeof created.size, "number");
+
+      const found = await repo.findById("record-1");
+      assert.ok(found);
+      assert.strictEqual(found.size, 5368709120);
+      assert.strictEqual(typeof found.size, "number");
+
+      const confirmed = await repo.confirmUpload("record-1", BigInt(6000000000));
+      assert.strictEqual(confirmed.size, 6000000000);
+      assert.strictEqual(typeof confirmed.size, "number");
+    });
+  });
+
+  describe("SEC-46: Decentralized JWT Verification Extracts RFC 7519 sub Claim", () => {
+    test("verifyJwtLocally resolves sub claim to req.user.id when id is omitted", async () => {
+      const token = jwt.sign(
+        {
+          sub: "user-fed-sub-999",
+          email: "federated@example.com",
+          role: ROLES.SAFETY_OFFICER,
+          permissions: [PERMISSIONS.FILE_READ],
+        },
+        rsaPrivateKey,
+        { algorithm: "RS256" },
+      );
+
+      const middleware = createVerifyJwtLocally({
+        publicKey: rsaPublicKey,
+      });
+
+      const req: any = {
+        headers: { authorization: `Bearer ${token}` },
+      };
+      const res: any = {};
+      let nextCalled = false;
+
+      await middleware(req, res, (err: any) => {
+        assert.ifError(err);
+        nextCalled = true;
+      });
+
+      assert.strictEqual(nextCalled, true);
+      assert.ok(req.user);
+      assert.strictEqual(req.user.id, "user-fed-sub-999");
+      assert.strictEqual(req.user.email, "federated@example.com");
+    });
+
+    test("verifyJwtLocally extracts sub claim for SSE stream ticket", async () => {
+      const ticket = jwt.sign(
+        {
+          sub: "sse-user-sub-111",
+          email: "sse@example.com",
+          role: ROLES.SAFETY_OFFICER,
+          permissions: [PERMISSIONS.FILE_READ],
+          purpose: JWT_PURPOSE.SSE_STREAM_TICKET,
+        },
+        jwtConfig.tempSecret,
+        { algorithm: "HS256" },
+      );
+
+      const middleware = createVerifyJwtLocally({
+        publicKey: rsaPublicKey,
+      });
+
+      const req: any = {
+        path: "/stream",
+        headers: { authorization: `Bearer ${ticket}` },
+      };
+      const res: any = {};
+      let nextCalled = false;
+
+      await middleware(req, res, (err: any) => {
+        assert.ifError(err);
+        nextCalled = true;
+      });
+
+      assert.strictEqual(nextCalled, true);
+      assert.ok(req.user);
+      assert.strictEqual(req.user.id, "sse-user-sub-111");
+    });
+  });
+
+  describe("SEC-47: Outbox Event Payload Encryption Whitelist Protects S3 Presigned URLs and Media Tokens", () => {
+    test("SENSITIVE_OUTBOX_FIELDS includes presignedUrl, uploadUrl, downloadUrl, accessKey, secretAccessKey, sessionToken, token, apiKey", () => {
+      const requiredFields = [
+        "presignedUrl",
+        "uploadUrl",
+        "downloadUrl",
+        "accessKey",
+        "secretAccessKey",
+        "sessionToken",
+        "token",
+        "apiKey",
+      ];
+      for (const field of requiredFields) {
+        assert.ok(
+          (SENSITIVE_OUTBOX_FIELDS as readonly string[]).includes(field),
+          `SENSITIVE_OUTBOX_FIELDS must include ${field}`,
+        );
+      }
+    });
+
+    test("encryptSensitivePayloadFields encrypts all sensitive media tokens and presigned URLs with enc: prefix", () => {
+      const sensitivePayload = {
+        fileId: "file-xyz",
+        presignedUrl: "https://r2.cloudflarestorage.com/bucket/key?X-Amz-Signature=secret123",
+        uploadUrl: "https://upload.service/target",
+        downloadUrl: "https://download.service/target?token=secret",
+        accessKey: "AKIAIOSFODNN7EXAMPLE",
+        secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        sessionToken: "session-token-abc",
+        token: "bearer-token-xyz",
+        apiKey: "api-secret-key-123",
+      };
+
+      const encrypted = eventBus.encryptSensitivePayloadFields(sensitivePayload);
+
+      assert.strictEqual(encrypted.fileId, "file-xyz");
+      assert.ok(encrypted.presignedUrl.startsWith("enc:"), "presignedUrl must be encrypted");
+      assert.ok(encrypted.uploadUrl.startsWith("enc:"), "uploadUrl must be encrypted");
+      assert.ok(encrypted.downloadUrl.startsWith("enc:"), "downloadUrl must be encrypted");
+      assert.ok(encrypted.accessKey.startsWith("enc:"), "accessKey must be encrypted");
+      assert.ok(encrypted.secretAccessKey.startsWith("enc:"), "secretAccessKey must be encrypted");
+      assert.ok(encrypted.sessionToken.startsWith("enc:"), "sessionToken must be encrypted");
+      assert.ok(encrypted.token.startsWith("enc:"), "token must be encrypted");
+      assert.ok(encrypted.apiKey.startsWith("enc:"), "apiKey must be encrypted");
+
+      const decrypted = eventBus.decryptSensitivePayloadFields(encrypted);
+      assert.deepStrictEqual(decrypted, sensitivePayload, "Decrypted payload must match original");
+    });
+  });
+
+  describe("SEC-48: S3 Batch Deletion Inspects Errors to Prevent Leaking Storage Blobs", () => {
+    test("R2Service.deleteFiles throws AppError 500 when S3 returns response.Errors", async () => {
+      const r2Service = new R2Service();
+      (r2Service as any).client = {
+        send: async () => ({
+          Errors: [
+            {
+              Key: "orphans/file-1.bin",
+              Code: "AccessDenied",
+              Message: "Access Denied by bucket policy",
+            },
+          ],
+        }),
+      };
+
+      await assert.rejects(
+        async () => {
+          await r2Service.deleteFiles(["orphans/file-1.bin"]);
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 500);
+          assert.strictEqual(err.code, ERROR_CODE.INTERNAL_SERVER_ERROR);
+          assert.ok(err.message.includes("S3 batch deletion partial failure"));
+          assert.ok(err.message.includes("orphans/file-1.bin"));
+          return true;
+        },
+      );
+    });
+
+    test("FileService.cleanupOrphanFiles preserves DB records when R2Service.deleteFiles throws on S3 errors", async () => {
+      let hardDeleteCalled = false;
+      const mockRepo: any = {
+        findUnconfirmedOlderThan: async () => [
+          { id: "orphan-id-1", bucketKey: "orphans/file-1.bin" },
+        ],
+        markCleanupPending: async () => ({ count: 1 }),
+        hardDeleteMany: async () => {
+          hardDeleteCalled = true;
+          return { count: 1 };
+        },
+        findSoftDeletedOlderThan: async () => [],
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        deleteFiles: async () => {
+          throw new AppError("S3 batch deletion partial failure", 500, ERROR_CODE.INTERNAL_SERVER_ERROR);
+        },
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+      const result = await service.cleanupOrphanFiles(24, 30);
+
+      assert.strictEqual(result.unconfirmedCleaned, 0);
+      assert.strictEqual(hardDeleteCalled, false, "hardDeleteMany must NOT be called when R2 batch deletion fails");
     });
   });
 });

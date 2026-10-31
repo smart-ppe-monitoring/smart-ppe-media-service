@@ -21,6 +21,13 @@ import { registerFileOpenApi } from "./modules/files/file.openapi";
 // Khởi tạo các định nghĩa OpenAPI
 registerFileOpenApi();
 
+// SEC-45: Đảm bảo JSON.stringify tuần tự hóa an toàn kiểu dữ liệu BigInt sang số nguyên chuẩn
+if (typeof (BigInt.prototype as any).toJSON !== "function") {
+  (BigInt.prototype as any).toJSON = function () {
+    return Number(this);
+  };
+}
+
 /**
  * Express Application cho Media & File Storage Microservice (Phase 6: Second Satellite Service)
  *
