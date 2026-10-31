@@ -11,9 +11,11 @@ export { uuidv7 };
 export const generateId = uuidv7;
 
 /**
- * Regex matching standard 36-character hyphenated UUID strings (v1-v7).
+ * Regex matching standard 36-character hyphenated UUID strings (8-4-4-4-12 hex groups, v1-v7).
+ * SEC-15: Enforce strict RFC 4122 / RFC 9562 structure to prevent non-UUID inputs from causing 22P02 DB syntax errors.
  */
-export const UUID_REGEX = /^[0-9a-fA-F-]{36}$/;
+export const UUID_REGEX =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 /**
  * Type guard verifying if an unknown value is a 36-character hyphenated UUID string.

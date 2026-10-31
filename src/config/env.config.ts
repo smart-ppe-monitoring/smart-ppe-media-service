@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 
 const envSchema = z
@@ -269,19 +271,29 @@ const envSchema = z
   )
   .refine(
     (env) => {
+      // SEC-16: Là một satellite microservice, smart-ppe-media-service chỉ xác thực JWT offline
+      // bằng Public Key và không bao giờ ký token. Do đó, tuyệt đối không đòi hỏi JWT_PRIVATE_KEY
+      // trong môi trường production mà chỉ yêu cầu JWT_PUBLIC_KEY, keys/public.key.pem hoặc AUTH_JWKS_URL.
       if (env.NODE_ENV !== "production") return true;
       if (env.JWT_ALGORITHM === "RS256") {
-        return (
-          typeof env.JWT_PRIVATE_KEY === "string" &&
-          env.JWT_PRIVATE_KEY.trim().length > 0
-        );
+        const hasPublicKeyEnv =
+          typeof env.JWT_PUBLIC_KEY === "string" &&
+          env.JWT_PUBLIC_KEY.trim().length > 0;
+        const hasJwksUrl =
+          typeof env.AUTH_JWKS_URL === "string" &&
+          env.AUTH_JWKS_URL.trim().length > 0;
+        const hasPublicKeyFile =
+          fs.existsSync(path.resolve(process.cwd(), "keys", "public.key.pem")) ||
+          fs.existsSync(path.resolve(process.cwd(), "public.key.pem"));
+
+        return hasPublicKeyEnv || hasJwksUrl || hasPublicKeyFile;
       }
       return true;
     },
     {
       message:
-        "JWT_PRIVATE_KEY bắt buộc phải được cấu hình khi JWT_ALGORITHM=RS256 trong môi trường production (định dạng PEM, base64 hoặc đường dẫn file)",
-      path: ["JWT_PRIVATE_KEY"],
+        "JWT_PUBLIC_KEY, keys/public.key.pem hoặc AUTH_JWKS_URL bắt buộc phải được cấu hình khi JWT_ALGORITHM=RS256 trong môi trường production cho satellite service",
+      path: ["JWT_PUBLIC_KEY"],
     },
   )
   .refine(

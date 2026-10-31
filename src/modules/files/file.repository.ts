@@ -244,65 +244,74 @@ export class FileRepository {
 
     const whereClause = Prisma.sql`WHERE ${Prisma.join(whereConditions, " AND ")}`;
 
-    const [rawFiles, countResult] = await prisma.$transaction([
-      prisma.$queryRaw<
-        Array<{
-          id: string;
-          user_id: string | null;
-          original_name: string;
-          file_name: string;
-          mime_type: string;
-          size: number;
-          bucket_key: string;
-          folder: string;
-          is_public: boolean;
-          is_confirmed: boolean;
-          metadata: unknown;
-          created_at: Date;
-          updated_at: Date;
-          rank: number;
-        }>
-      >`
-        SELECT
-          f.id, f.user_id, f.original_name, f.file_name, f.mime_type,
-          f.size, f.bucket_key, f.folder, f.is_public, f.is_confirmed,
-          f.metadata, f.created_at, f.updated_at,
-          ts_rank(${FILE_RECORDS_FTS_VECTOR_EXPR}, to_tsquery('simple', ${tsQuery})) as rank
-        FROM file_records f
-        ${whereClause}
-        ORDER BY rank DESC, f.created_at DESC
-        OFFSET ${skip}
-        LIMIT ${take}
-      `,
-      prisma.$queryRaw<Array<{ count: bigint }>>`
-        SELECT COUNT(*)::bigint as count
-        FROM file_records f
-        ${whereClause}
-      `,
-    ]);
+    try {
+      const [rawFiles, countResult] = await prisma.$transaction([
+        prisma.$queryRaw<
+          Array<{
+            id: string;
+            user_id: string | null;
+            original_name: string;
+            file_name: string;
+            mime_type: string;
+            size: number;
+            bucket_key: string;
+            folder: string;
+            is_public: boolean;
+            is_confirmed: boolean;
+            metadata: unknown;
+            created_at: Date;
+            updated_at: Date;
+            rank: number;
+          }>
+        >`
+          SELECT
+            f.id, f.user_id, f.original_name, f.file_name, f.mime_type,
+            f.size, f.bucket_key, f.folder, f.is_public, f.is_confirmed,
+            f.metadata, f.created_at, f.updated_at,
+            ts_rank(${FILE_RECORDS_FTS_VECTOR_EXPR}, to_tsquery('simple', ${tsQuery})) as rank
+          FROM file_records f
+          ${whereClause}
+          ORDER BY rank DESC, f.created_at DESC
+          OFFSET ${skip}
+          LIMIT ${take}
+        `,
+        prisma.$queryRaw<Array<{ count: bigint }>>`
+          SELECT COUNT(*)::bigint as count
+          FROM file_records f
+          ${whereClause}
+        `,
+      ]);
 
-    const total = Number(countResult[0]?.count ?? 0);
-    const data = rawFiles.map((f) => ({
-      id: f.id,
-      userId: f.user_id,
-      originalName: f.original_name,
-      fileName: f.file_name,
-      mimeType: f.mime_type,
-      size: f.size,
-      bucketKey: f.bucket_key,
-      folder: f.folder,
-      isPublic: f.is_public,
-      isConfirmed: f.is_confirmed,
-      metadata: f.metadata,
-      createdAt: f.created_at,
-      updatedAt: f.updated_at,
-      user: f.user_id ? { id: f.user_id, fullName: null } : null,
-    }));
+      const total = Number(countResult[0]?.count ?? 0);
+      const data = rawFiles.map((f) => ({
+        id: f.id,
+        userId: f.user_id,
+        originalName: f.original_name,
+        fileName: f.file_name,
+        mimeType: f.mime_type,
+        size: f.size,
+        bucketKey: f.bucket_key,
+        folder: f.folder,
+        isPublic: f.is_public,
+        isConfirmed: f.is_confirmed,
+        metadata: f.metadata,
+        createdAt: f.created_at,
+        updatedAt: f.updated_at,
+        user: f.user_id ? { id: f.user_id, fullName: null } : null,
+      }));
 
-    return {
-      data,
-      meta: formatPaginationMeta(safePage, safeLimit, total),
-    };
+      return {
+        data,
+        meta: formatPaginationMeta(safePage, safeLimit, total),
+      };
+    } catch (err: any) {
+      // SEC-13: Chặn lỗi cú pháp FTS 42601 hoặc ngoại lệ truy vấn thô to_tsquery
+      // làm sập HTTP 500; fallback an toàn về tìm kiếm tiêu chuẩn findAll
+      console.warn(
+        `[FileRepository] Full-Text Search query failed (${err?.code || err?.message}), falling back to standard findAll.`,
+      );
+      return this.findAll(query, currentUserId, canManageAll);
+    }
   }
 
   /**
