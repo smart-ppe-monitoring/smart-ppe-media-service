@@ -16,7 +16,11 @@ import { directImageUploadSchema } from "../src/modules/files/file.validation";
 import { envConfig } from "../src/config/env.config";
 import { z } from "zod";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-22)", { concurrency: false }, () => {
+import { AUDIT_ACTION } from "../src/common/constants/audit-log.constant";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-33)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -625,6 +629,201 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-22)", { c
         createdWithIsPublic,
         false,
         "uploadAndProcessImage must default isPublic to false when options.isPublic is omitted",
+      );
+    });
+  });
+
+  // ── SEC-31 ───────────────────────────────────────────────────────────────
+  describe("SEC-31: Database Initial Migrations Directory and PostgreSQL Function Definition for uuid_generate_v7", () => {
+    test("initial migration file exists in prisma/migrations directory", () => {
+      const migrationDir = path.resolve(__dirname, "../prisma/migrations/20261014150000_init_media_schema_and_uuidv7");
+      const migrationFile = path.join(migrationDir, "migration.sql");
+
+      assert.ok(
+        fs.existsSync(migrationFile),
+        "Initial migration file 20261014150000_init_media_schema_and_uuidv7/migration.sql must exist",
+      );
+
+      const content = fs.readFileSync(migrationFile, "utf-8");
+      assert.ok(
+        content.includes("CREATE OR REPLACE FUNCTION uuid_generate_v7()"),
+        "Migration must define stored procedure uuid_generate_v7()",
+      );
+      assert.ok(
+        content.includes('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"') ||
+        content.includes('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'),
+        "Migration must enable pgcrypto / uuid-ossp extensions",
+      );
+      assert.ok(
+        content.includes('CREATE TABLE IF NOT EXISTS "file_records"'),
+        "Migration must create file_records base table",
+      );
+      assert.ok(
+        content.includes('CREATE TABLE IF NOT EXISTS "audit_logs"'),
+        "Migration must create audit_logs base table",
+      );
+      assert.ok(
+        content.includes('CREATE TABLE IF NOT EXISTS "outbox_events"'),
+        "Migration must create outbox_events base table",
+      );
+    });
+  });
+
+  // ── SEC-32 ───────────────────────────────────────────────────────────────
+  describe("SEC-32: Audit Logging on Sensitive Media Read, Download, and Transformation Operations", () => {
+    test("FileService.getFileById records AUDIT_ACTION.READ_FILE in audit logs", async () => {
+      let loggedAction = "";
+      let loggedTargetId = "";
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "sensitive-file-read-1",
+          userId: "user-read-1",
+          bucketKey: "evidence/photo.jpg",
+          fileName: "photo.jpg",
+          isPublic: true,
+        }),
+        createAuditLog: async (log: any) => {
+          loggedAction = log.action;
+          loggedTargetId = log.targetId;
+        },
+      };
+
+      const mockR2: any = {
+        getPublicUrl: () => "https://r2/photo.jpg",
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+
+      await service.getFileById("sensitive-file-read-1", "user-read-1");
+
+      assert.strictEqual(
+        loggedAction,
+        AUDIT_ACTION.READ_FILE,
+        "getFileById must record READ_FILE audit log",
+      );
+      assert.strictEqual(loggedTargetId, "sensitive-file-read-1");
+    });
+
+    test("FileService.getPresignedDownloadUrl records AUDIT_ACTION.DOWNLOAD_FILE in audit logs", async () => {
+      let loggedAction = "";
+      let loggedTargetId = "";
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "sensitive-file-dl-2",
+          userId: "user-dl-2",
+          bucketKey: "evidence/video.mp4",
+          fileName: "video.mp4",
+          originalName: "video.mp4",
+          isPublic: true,
+          isConfirmed: true,
+        }),
+        createAuditLog: async (log: any) => {
+          loggedAction = log.action;
+          loggedTargetId = log.targetId;
+        },
+      };
+
+      const mockR2: any = {
+        getPresignedDownloadUrl: async () => "https://r2-download/video.mp4",
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+
+      await service.getPresignedDownloadUrl("sensitive-file-dl-2", "user-dl-2");
+
+      assert.strictEqual(
+        loggedAction,
+        AUDIT_ACTION.DOWNLOAD_FILE,
+        "getPresignedDownloadUrl must record DOWNLOAD_FILE audit log",
+      );
+      assert.strictEqual(loggedTargetId, "sensitive-file-dl-2");
+    });
+
+    test("FileService.transformExistingImage records AUDIT_ACTION.TRANSFORM_IMAGE on read/transform", async () => {
+      let loggedAction = "";
+      let loggedTargetId = "";
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "transform-file-3",
+          userId: "user-tx-3",
+          bucketKey: "evidence/crop.png",
+          fileName: "crop.png",
+          originalName: "crop.png",
+          mimeType: "image/png",
+          isPublic: true,
+          isConfirmed: true,
+        }),
+        createAuditLog: async (log: any) => {
+          loggedAction = log.action;
+          loggedTargetId = log.targetId;
+        },
+      };
+
+      const mockR2: any = {
+        getObjectBuffer: async () => Buffer.from("png-bytes"),
+      };
+
+      const mockProcessor: any = {
+        isSupportedImageMime: () => true,
+        processImage: async () => ({
+          buffer: Buffer.from("transformed-bytes"),
+          info: { format: "png", width: 200, height: 200, size: 500, mimeType: "image/png" },
+        }),
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, mockProcessor);
+
+      await service.transformExistingImage(
+        "transform-file-3",
+        { saveAsNew: false, width: 200, height: 200 },
+        "user-tx-3",
+      );
+
+      assert.strictEqual(
+        loggedAction,
+        AUDIT_ACTION.TRANSFORM_IMAGE,
+        "transformExistingImage on read must record TRANSFORM_IMAGE audit log",
+      );
+      assert.strictEqual(loggedTargetId, "transform-file-3");
+    });
+  });
+
+  // ── SEC-33 ───────────────────────────────────────────────────────────────
+  describe("SEC-33: Multi-Repo Database Isolation Omits Foreign Microservice URLs", () => {
+    test("envConfig.database isolates media database and omits foreign microservice database URLs", () => {
+      assert.ok(envConfig.database.url, "envConfig.database.url must be defined");
+      assert.strictEqual(
+        (envConfig.database as any).identityUrl,
+        undefined,
+        "IDENTITY_DATABASE_URL must not be exposed in media service config",
+      );
+      assert.strictEqual(
+        (envConfig.database as any).siteUrl,
+        undefined,
+        "SITE_DATABASE_URL must not be exposed in media service config",
+      );
+      assert.strictEqual(
+        (envConfig.database as any).cameraUrl,
+        undefined,
+        "CAMERA_DATABASE_URL must not be exposed in media service config",
+      );
+      assert.strictEqual(
+        (envConfig.database as any).incidentUrl,
+        undefined,
+        "INCIDENT_DATABASE_URL must not be exposed in media service config",
+      );
+      assert.strictEqual(
+        (envConfig.database as any).notificationUrl,
+        undefined,
+        "NOTIFICATION_DATABASE_URL must not be exposed in media service config",
+      );
+      assert.strictEqual(
+        (envConfig.database as any).reportingUrl,
+        undefined,
+        "REPORTING_DATABASE_URL must not be exposed in media service config",
       );
     });
   });

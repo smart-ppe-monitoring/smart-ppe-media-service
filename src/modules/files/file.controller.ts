@@ -70,6 +70,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       res.json({
@@ -88,6 +89,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       res.json({
@@ -106,6 +108,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       res.redirect(302, result.downloadUrl);
@@ -210,6 +213,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       // Nếu trả về buffer binary trực tiếp

@@ -352,6 +352,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     role?: string,
+    metadata?: { ipAddress?: string; userAgent?: string },
   ): Promise<FileResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -387,6 +388,23 @@ export class FileService {
       }
     }
 
+    // SEC-32: Audit logging for sensitive media read operations
+    if (typeof this.repository?.createAuditLog === "function") {
+      await this.repository.createAuditLog({
+        actorId: userId,
+        action: AUDIT_ACTION.READ_FILE,
+        targetType: AUDIT_TARGET_TYPE.FILE,
+        targetId: file.id,
+        details: {
+          bucketKey: file.bucketKey,
+          fileName: file.fileName,
+          isPublic: file.isPublic,
+        },
+        ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+      });
+    }
+
     return {
       ...file,
       url: file.isPublic
@@ -400,6 +418,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     role?: string,
+    metadata?: { ipAddress?: string; userAgent?: string },
   ): Promise<DownloadUrlResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -450,6 +469,23 @@ export class FileService {
       expiresIn,
       file.originalName,
     );
+
+    // SEC-32: Audit logging for sensitive media presigned download URL generation
+    if (typeof this.repository?.createAuditLog === "function") {
+      await this.repository.createAuditLog({
+        actorId: userId,
+        action: AUDIT_ACTION.DOWNLOAD_FILE,
+        targetType: AUDIT_TARGET_TYPE.FILE,
+        targetId: file.id,
+        details: {
+          bucketKey: file.bucketKey,
+          fileName: file.originalName,
+          isPublic: file.isPublic,
+        },
+        ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+      });
+    }
 
     return {
       downloadUrl,
@@ -715,6 +751,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     role?: string,
+    metadata?: { ipAddress?: string; userAgent?: string },
   ): Promise<
     | {
         buffer: Buffer;
@@ -905,6 +942,26 @@ export class FileService {
           ? this.r2Service.getPublicUrl(record.bucketKey)
           : undefined,
       };
+    }
+
+    // SEC-32: Audit logging for on-the-fly image transformations
+    if (typeof this.repository?.createAuditLog === "function") {
+      await this.repository.createAuditLog({
+        actorId: userId,
+        action: AUDIT_ACTION.TRANSFORM_IMAGE,
+        targetType: AUDIT_TARGET_TYPE.FILE,
+        targetId: file.id,
+        details: {
+          bucketKey: file.bucketKey,
+          width: options.width,
+          height: options.height,
+          fit: options.fit,
+          format: options.format,
+          quality: options.quality,
+        },
+        ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+      });
     }
 
     return {

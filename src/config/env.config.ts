@@ -11,14 +11,7 @@ const envSchema = z
       .default("development"),
     PORT: z.coerce.number().int().positive().default(8890),
 
-    // ── Database (Database-per-Service Architecture) ─────────────────────────
-    IDENTITY_DATABASE_URL: z.string().optional(),
-    // Các service DB URLs — optional vì không phải service nào cũng active đồng thời
-    SITE_DATABASE_URL: z.string().optional(),
-    CAMERA_DATABASE_URL: z.string().optional(),
-    INCIDENT_DATABASE_URL: z.string().optional(),
-    NOTIFICATION_DATABASE_URL: z.string().optional(),
-    REPORTING_DATABASE_URL: z.string().optional(),
+    // ── Database (Database-per-Service Architecture: SEC-33) ─────────────────
     MEDIA_DATABASE_URL: z
       .string()
       .min(1, "MEDIA_DATABASE_URL is required")
@@ -409,12 +402,6 @@ export const envConfig = {
   database: {
     url: _env.MEDIA_DATABASE_URL,
     mediaUrl: _env.MEDIA_DATABASE_URL,
-    identityUrl: _env.IDENTITY_DATABASE_URL,
-    siteUrl: _env.SITE_DATABASE_URL,
-    cameraUrl: _env.CAMERA_DATABASE_URL,
-    incidentUrl: _env.INCIDENT_DATABASE_URL,
-    notificationUrl: _env.NOTIFICATION_DATABASE_URL,
-    reportingUrl: _env.REPORTING_DATABASE_URL,
   },
   jwt: {
     algorithm: _env.JWT_ALGORITHM,
