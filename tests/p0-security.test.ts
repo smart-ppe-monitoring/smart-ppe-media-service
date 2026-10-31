@@ -1,6 +1,7 @@
 import { test, describe, before } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import jwt from "jsonwebtoken";
 import { authMiddleware } from "../src/middlewares/auth.middleware";
 import { requirePermission, requireAnyPermission } from "../src/middlewares/permission.middleware";
@@ -19,8 +20,15 @@ import {
 import { DEFAULT_ALLOWED_MIME_TYPES } from "../src/common/constants/system-config.constant";
 import { FileService } from "../src/modules/files/file.service";
 import { uploadImageMiddleware } from "../src/middlewares/upload.middleware";
+import {
+  createVerifyJwtLocally,
+  clearJwtPublicKeyCache,
+} from "../src/middlewares/verify-jwt-locally.middleware";
+import { JwtKeyService } from "../src/common/services/jwt-key.service";
+import { envConfig } from "../src/config/env.config";
+import { jwtConfig } from "../src/config/jwt.config";
 
-describe("P0 Security Vulnerabilities Patch Verification (SEC-01 - SEC-04, SEC-23 - SEC-24)", () => {
+describe("P0 Security Vulnerabilities Patch Verification (SEC-01 - SEC-04, SEC-23 - SEC-24, SEC-36 - SEC-37)", () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -480,6 +488,197 @@ describe("P0 Security Vulnerabilities Patch Verification (SEC-01 - SEC-04, SEC-2
         assert.strictEqual(accepted, undefined);
         done();
       });
+    });
+  });
+
+  describe("SEC-36: Mitigate JWKS fetch key rotation unbounded HTTP amplification DoS", () => {
+    const originalFetch = globalThis.fetch;
+
+    test("coalesces concurrent requests for unknown kid into a single outbound fetch", async () => {
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount++;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return {
+          ok: true,
+          json: async () => ({
+            keys: [
+              {
+                kty: "RSA",
+                kid: "identity-key-alpha",
+                use: "sig",
+                alg: "RS256",
+                n: "u123",
+                e: "AQAB",
+              },
+            ],
+          }),
+        } as any;
+      }) as any;
+
+      clearJwtPublicKeyCache();
+
+      const middleware = createVerifyJwtLocally({
+        jwksUri: "https://auth-service.local/.well-known/jwks.json",
+        autoRefreshOnUnknownKid: true,
+      });
+
+      // Dispatch 5 concurrent requests with tokens having unknown kid
+      const requests = Array.from({ length: 5 }).map(async (_, idx) => {
+        const token = jwt.sign(
+          { id: `user-${idx}`, role: "USER", purpose: "ACCESS" },
+          rsaPrivateKey,
+          { algorithm: "RS256", keyid: "unknown-kid-concurrent" },
+        );
+        const req: any = {
+          headers: { authorization: `Bearer ${token}` },
+        };
+        const res: any = {};
+        let errResult: any = null;
+        await middleware(req, res, (err) => {
+          errResult = err;
+        });
+        return errResult;
+      });
+
+      const results = await Promise.all(requests);
+
+      // Verify all requests received an error (kid was not in JWKS)
+      for (const err of results) {
+        assert.ok(err instanceof AppError);
+      }
+
+      // Assert that exactly 1 outbound HTTP call was made (single-flight coalesced)
+      assert.strictEqual(fetchCount, 1, "Must coalesce concurrent JWKS requests into 1 fetch");
+    });
+
+    test("enforces cooldown to block rapid consecutive outbound JWKS fetches", async () => {
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount++;
+        return {
+          ok: true,
+          json: async () => ({
+            keys: [],
+          }),
+        } as any;
+      }) as any;
+
+      clearJwtPublicKeyCache();
+
+      const middleware = createVerifyJwtLocally({
+        jwksUri: "https://auth-service.local/.well-known/jwks.json",
+        autoRefreshOnUnknownKid: true,
+      });
+
+      // First call triggers fetch
+      const token1 = jwt.sign(
+        { id: "user-1", role: "USER", purpose: "ACCESS" },
+        rsaPrivateKey,
+        { algorithm: "RS256", keyid: "kid-cooldown-1" },
+      );
+      await middleware({ headers: { authorization: `Bearer ${token1}` } } as any, {} as any, () => {});
+      assert.strictEqual(fetchCount, 1, "First request must trigger fetch");
+
+      // Immediate second request with a different kid within 10s cooldown
+      const token2 = jwt.sign(
+        { id: "user-2", role: "USER", purpose: "ACCESS" },
+        rsaPrivateKey,
+        { algorithm: "RS256", keyid: "kid-cooldown-2" },
+      );
+      await middleware({ headers: { authorization: `Bearer ${token2}` } } as any, {} as any, () => {});
+
+      // Fetch count should NOT increase due to 10s cooldown
+      assert.strictEqual(fetchCount, 1, "Consecutive request within cooldown must not fire second outbound fetch");
+    });
+
+    test("negative cache (tombstone) rejects repeated lookups for same invalid kid without fetch", async () => {
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount++;
+        return {
+          ok: true,
+          json: async () => ({ keys: [] }),
+        } as any;
+      }) as any;
+
+      clearJwtPublicKeyCache();
+
+      const middleware = createVerifyJwtLocally({
+        jwksUri: "https://auth-service.local/.well-known/jwks.json",
+      });
+
+      const token = jwt.sign(
+        { id: "user-1", role: "USER", purpose: "ACCESS" },
+        rsaPrivateKey,
+        { algorithm: "RS256", keyid: "bogus-tombstoned-kid" },
+      );
+
+      // First request
+      await middleware({ headers: { authorization: `Bearer ${token}` } } as any, {} as any, () => {});
+      const initialFetchCount = fetchCount;
+
+      // Second request with same bogus kid
+      await middleware({ headers: { authorization: `Bearer ${token}` } } as any, {} as any, () => {});
+
+      assert.strictEqual(fetchCount, initialFetchCount, "Tombstoned kid must not re-trigger fetch");
+
+      // Restore fetch
+      globalThis.fetch = originalFetch;
+    });
+  });
+
+  describe("SEC-37: JwtKeyService fails fast and preserves trusted Public Key in decentralized auth", () => {
+    test("preserves configured Public Key when Private Key is absent on satellite service", () => {
+      const origPublic = jwtConfig.publicKey;
+      const origPrivate = jwtConfig.privateKey;
+
+      try {
+        // Satellite service has only Public Key
+        (jwtConfig as any).publicKey = rsaPublicKey;
+        (jwtConfig as any).privateKey = "";
+
+        const service = new JwtKeyService();
+        assert.strictEqual(service.getPublicKeyPem().trim(), rsaPublicKey.trim());
+        assert.strictEqual(service.getPrivateKeyPem(), "");
+      } finally {
+        (jwtConfig as any).publicKey = origPublic;
+        (jwtConfig as any).privateKey = origPrivate;
+      }
+    });
+
+    test("fails fast in production when trusted Public Key is missing", () => {
+      const origPublic = jwtConfig.publicKey;
+      const origPrivate = jwtConfig.privateKey;
+      const origNodeEnv = envConfig.nodeEnv;
+      const origExistsSync = fs.existsSync;
+
+      try {
+        (jwtConfig as any).publicKey = "";
+        (jwtConfig as any).privateKey = "";
+        (envConfig as any).nodeEnv = "production";
+        // Giả lập keys không tồn tại trên ổ đĩa
+        (fs as any).existsSync = () => false;
+
+        assert.throws(
+          () => {
+            new JwtKeyService();
+          },
+          (err: any) => {
+            assert.ok(err instanceof Error);
+            assert.ok(
+              err.message.includes("FATAL: Trusted JWT Public Key not found"),
+              `Expected fatal error message, got: ${err.message}`,
+            );
+            return true;
+          },
+        );
+      } finally {
+        (jwtConfig as any).publicKey = origPublic;
+        (jwtConfig as any).privateKey = origPrivate;
+        (envConfig as any).nodeEnv = origNodeEnv;
+        (fs as any).existsSync = origExistsSync;
+      }
     });
   });
 });
