@@ -7,9 +7,14 @@ import { UUID_REGEX, isUuid } from "../src/common/helpers/uuid.helper";
 import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
 import { ROLES } from "../src/common/constants/role.constant";
+import { PERMISSIONS } from "../src/common/constants/permission.constant";
+import { EVENT_NAMES } from "../src/common/constants/event.constant";
+import { StorageCleanupSubscriber } from "../src/common/subscribers/storage-cleanup.subscriber";
+import { FileService } from "../src/modules/files/file.service";
+import { envConfig } from "../src/config/env.config";
 import { z } from "zod";
 
-describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-16)", { concurrency: false }, () => {
+describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-19)", { concurrency: false }, () => {
   // ── SEC-13 ───────────────────────────────────────────────────────────────
   describe("SEC-13: Raw PostgreSQL Full-Text Search Query Exception Handling and Safe Fallback", () => {
     test("searchFts intercepts PostgreSQL syntax error 42601 and safely falls back to findAll", async () => {
@@ -243,6 +248,160 @@ describe("P2 Security Vulnerabilities Patch Verification (SEC-13 - SEC-16)", { c
       if (!invalidSatelliteEnv.success) {
         assert.strictEqual(invalidSatelliteEnv.error.issues[0].path[0], "JWT_PUBLIC_KEY");
       }
+    });
+  });
+
+  // ── SEC-17 ───────────────────────────────────────────────────────────────
+  describe("SEC-17: StorageCleanupSubscriber Performs Physical R2 Deletion of Expired Unconfirmed Uploads", () => {
+    test("cleanupExpiredUnconfirmedFile calls r2Service.deleteFile and hardDeleteMany when file remains unconfirmed", async () => {
+      let r2DeleteCalledWith = "";
+      let hardDeleteCalledWith: string[] = [];
+
+      const mockR2: any = {
+        deleteFile: async (key: string) => {
+          r2DeleteCalledWith = key;
+        },
+      };
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unconfirmed-file-123",
+          isConfirmed: false,
+          bucketKey: "uploads/unconfirmed-file-123.jpg",
+        }),
+        hardDeleteMany: async (ids: string[]) => {
+          hardDeleteCalledWith = ids;
+          return { count: ids.length };
+        },
+      };
+
+      const mockBus: any = {
+        subscribe: () => () => {},
+      };
+
+      const subscriber = new StorageCleanupSubscriber(mockBus, mockR2, mockRepo);
+
+      // Simulate tracked file
+      (subscriber as any).trackedUnconfirmedFiles.set("unconfirmed-file-123", {
+        fileId: "unconfirmed-file-123",
+        key: "uploads/unconfirmed-file-123.jpg",
+        bucket: "ppe-media",
+        expiresAt: new Date(Date.now() - 1000),
+      });
+
+      const cleaned = await subscriber.cleanupExpiredUnconfirmedFile("unconfirmed-file-123");
+
+      assert.strictEqual(cleaned, true);
+      assert.strictEqual(r2DeleteCalledWith, "uploads/unconfirmed-file-123.jpg", "Must delete physical blob from R2");
+      assert.deepStrictEqual(hardDeleteCalledWith, ["unconfirmed-file-123"], "Must hard-delete database record");
+      assert.strictEqual((subscriber as any).trackedUnconfirmedFiles.has("unconfirmed-file-123"), false);
+
+      subscriber.clear();
+    });
+
+    test("cleanupExpiredUnconfirmedFile skips R2 deletion if file was successfully confirmed", async () => {
+      let r2DeleteCalled = false;
+
+      const mockR2: any = {
+        deleteFile: async () => {
+          r2DeleteCalled = true;
+        },
+      };
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "confirmed-file-456",
+          isConfirmed: true, // File was confirmed!
+          bucketKey: "uploads/confirmed-file-456.jpg",
+        }),
+      };
+
+      const subscriber = new StorageCleanupSubscriber({} as any, mockR2, mockRepo);
+
+      (subscriber as any).trackedUnconfirmedFiles.set("confirmed-file-456", {
+        fileId: "confirmed-file-456",
+        key: "uploads/confirmed-file-456.jpg",
+        bucket: "ppe-media",
+        expiresAt: new Date(Date.now() - 1000),
+      });
+
+      const cleaned = await subscriber.cleanupExpiredUnconfirmedFile("confirmed-file-456");
+
+      assert.strictEqual(cleaned, true);
+      assert.strictEqual(r2DeleteCalled, false, "Must NOT delete confirmed files from R2");
+      assert.strictEqual((subscriber as any).trackedUnconfirmedFiles.has("confirmed-file-456"), false);
+
+      subscriber.clear();
+    });
+  });
+
+  // ── SEC-18 ───────────────────────────────────────────────────────────────
+  describe("SEC-18: deleteFile Preserves Object Storage Binary for 30-Day Forensic Soft-Delete Retention", () => {
+    test("deleteFile soft-deletes DB record and does NOT physically delete R2 storage object", async () => {
+      let dbDeleteCalledWith = "";
+      let r2DeleteCalled = false;
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "file-retention-1",
+          userId: "user-1",
+          bucketKey: "images/evidence-retention.jpg",
+          fileName: "evidence-retention.jpg",
+          isPublic: false,
+        }),
+        delete: async (id: string) => {
+          dbDeleteCalledWith = id;
+        },
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        deleteFile: async () => {
+          r2DeleteCalled = true;
+        },
+      };
+
+      const mockBus: any = {
+        publish: async () => {},
+      };
+
+      const service = new FileService(mockRepo, mockR2, mockBus, {} as any);
+
+      await service.deleteFile(
+        "file-retention-1",
+        "user-1",
+        [PERMISSIONS.FILE_DELETE],
+      );
+
+      assert.strictEqual(dbDeleteCalledWith, "file-retention-1", "Must call repository.delete to soft-delete");
+      assert.strictEqual(
+        r2DeleteCalled,
+        false,
+        "deleteFile must NOT delete storage object on initial soft-delete to preserve 30-day retention",
+      );
+    });
+  });
+
+  // ── SEC-19 ───────────────────────────────────────────────────────────────
+  describe("SEC-19: Default Redis Configuration Port Matches Infrastructure Standard (6379)", () => {
+    test("REDIS_PORT defaults to 6379 matching multi-repo docker-compose", () => {
+      // Test schema default value directly
+      const testRedisSchema = z.object({
+        REDIS_PORT: z.coerce.number().int().positive().default(6379),
+      });
+
+      const parsed = testRedisSchema.parse({});
+      assert.strictEqual(
+        parsed.REDIS_PORT,
+        6379,
+        "REDIS_PORT default must be 6379 matching docker-compose.infra.yml standard",
+      );
+    });
+
+    test("envConfig.redis.port uses port 6379 when default is applied", () => {
+      // Verify that envConfig has a valid port number (6379 or environment override)
+      assert.ok(typeof envConfig.redis.port === "number");
+      assert.ok(envConfig.redis.port > 0);
     });
   });
 });

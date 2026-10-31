@@ -67,7 +67,7 @@ const envSchema = z
     // ── Redis ─────────────────────────────────────────────────────────────────
     REDIS_URL: z.string().default(""),
     REDIS_HOST: z.string().default("localhost"),
-    REDIS_PORT: z.coerce.number().int().positive().default(6381),
+    REDIS_PORT: z.coerce.number().int().positive().default(6379),
     REDIS_PASSWORD: z.string().default(""),
     REDIS_ENABLED: z.string().default("true"),
 

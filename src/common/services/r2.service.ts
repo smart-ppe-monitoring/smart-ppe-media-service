@@ -292,3 +292,5 @@ export class R2Service {
     }
   }
 }
+
+export const r2Service = new R2Service();

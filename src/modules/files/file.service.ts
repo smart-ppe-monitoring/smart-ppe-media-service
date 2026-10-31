@@ -526,15 +526,9 @@ export class FileService {
       );
     }
 
-    // Xóa file khỏi R2 bucket
-    await this.r2Service.deleteFile(file.bucketKey).catch((err) => {
-      console.warn(
-        `[FileService] Failed to delete file ${file.bucketKey} from R2:`,
-        err.message,
-      );
-    });
-
-    // Soft delete bản ghi trong database
+    // SEC-18: Bảo lưu binary trên R2 trong suốt thời hạn 30 ngày (soft-delete retention).
+    // Tuyệt đối không xóa physical storage object tại đây; việc xóa vĩnh viễn trên R2
+    // sẽ do cleanupOrphanFiles thực thi sau khi đã hết hạn lưu trữ 30 ngày.
     await this.repository.delete(id);
 
     await this.repository.createAuditLog({
