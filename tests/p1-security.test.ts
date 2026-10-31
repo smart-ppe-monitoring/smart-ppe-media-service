@@ -36,6 +36,10 @@ import { ROLES } from "../src/common/constants/role.constant";
 import { PERMISSIONS } from "../src/common/constants/permission.constant";
 import { EVENT_NAMES } from "../src/common/constants/event.constant";
 import { MEDIA_LIMITS } from "../src/common/constants/media.constant";
+import {
+  AUDIT_ACTION,
+  AUDIT_TARGET_TYPE,
+} from "../src/common/constants/audit-log.constant";
 import { R2Service } from "../src/common/services/r2.service";
 import { uploadImageMiddleware } from "../src/middlewares/upload.middleware";
 import { requireAnyPermission } from "../src/middlewares/permission.middleware";
@@ -58,8 +62,9 @@ import {
   SENSITIVE_OUTBOX_FIELDS,
 } from "../src/common/services/event-bus.service";
 import { OutboxRepository } from "../src/common/repositories/outbox.repository";
+import { prisma } from "../src/database/prisma.client";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-58)", { concurrency: false }, () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-61)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -980,6 +985,7 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-58)", { c
           mimeType: "image/jpeg",
           bucketKey: "images/img-1.jpg",
           isPublic: true,
+          isConfirmed: true,
         }),
       };
       const mockR2: any = {
@@ -1885,6 +1891,199 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-58)", { c
       } finally {
         unsub();
         await bus.close();
+      }
+    });
+  });
+
+  describe("SEC-59: Transformed Image Persistence Publishes file.created Event and Creates Audit Log", () => {
+    test("transformExistingImage with saveAsNew=true creates audit log and publishes file.created event", async () => {
+      let auditLogCreated = false;
+      let eventPublished = false;
+      let publishedPayload: any = null;
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "src-file-1",
+          originalName: "helmet_violation.jpg",
+          fileName: "helmet_violation_abc.jpg",
+          mimeType: "image/jpeg",
+          size: 2048,
+          bucketKey: "images/u1/helmet_violation_abc.jpg",
+          folder: "images",
+          isPublic: false,
+          isConfirmed: true,
+          userId: "u1",
+        }),
+        createDirectFile: async (data: any) => ({
+          id: "trans-file-1",
+          originalName: data.originalName,
+          fileName: data.fileName,
+          mimeType: data.mimeType,
+          size: data.size,
+          bucketKey: data.bucketKey,
+          folder: data.folder,
+          isPublic: data.isPublic,
+          userId: data.userId,
+          metadata: data.metadata,
+        }),
+        createAuditLog: async (log: any) => {
+          auditLogCreated = true;
+          assert.strictEqual(log.action, AUDIT_ACTION.UPLOAD_FILE);
+          assert.strictEqual(log.targetType, AUDIT_TARGET_TYPE.FILE);
+          assert.strictEqual(log.targetId, "trans-file-1");
+          assert.strictEqual(log.details.transformed, true);
+        },
+      };
+
+      const mockR2: any = {
+        getObjectBuffer: async () => Buffer.from("fake-original-jpeg-binary-data"),
+        uploadBuffer: async () => {},
+        getPublicUrl: () => undefined,
+      };
+
+      const mockProcessor: any = {
+        isSupportedImageMime: () => true,
+        processImage: async () => ({
+          buffer: Buffer.from("fake-transformed-webp-binary-data"),
+          info: {
+            format: "webp",
+            width: 300,
+            height: 300,
+            size: 1024,
+            mimeType: "image/webp",
+          },
+        }),
+      };
+
+      const mockEventBus: any = {
+        publish: async (name: string, payload: any) => {
+          eventPublished = true;
+          publishedPayload = payload;
+          assert.strictEqual(name, EVENT_NAMES.FILE_CREATED);
+        },
+      };
+
+      const service = new FileService(mockRepo, mockR2, mockEventBus as any, mockProcessor);
+
+      const result = await service.transformExistingImage(
+        "src-file-1",
+        { saveAsNew: true, width: 300, height: 300 },
+        "u1",
+        [PERMISSIONS.FILE_UPLOAD],
+        ROLES.OPERATOR,
+      );
+
+      assert.strictEqual(auditLogCreated, true, "createAuditLog must be called when saveAsNew=true");
+      assert.strictEqual(eventPublished, true, "file.created event must be published when saveAsNew=true");
+      assert.strictEqual(publishedPayload.fileId, "trans-file-1");
+      assert.strictEqual(publishedPayload.mimeType, "image/webp");
+      assert.strictEqual(publishedPayload.size, 1024);
+      assert.strictEqual(publishedPayload.userId, "u1");
+      assert.ok("id" in (result as any));
+    });
+  });
+
+  describe("SEC-60: Image Transform Endpoint Asserts isConfirmed Before Storage Download and Processing", () => {
+    test("transformExistingImage rejects unconfirmed files with 400 BAD_REQUEST and skips storage download", async () => {
+      let getObjectBufferCalled = false;
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "unconfirmed-file-1",
+          mimeType: "image/jpeg",
+          bucketKey: "images/unconfirmed.jpg",
+          isPublic: true,
+          isConfirmed: false,
+        }),
+      };
+      const mockR2: any = {
+        getObjectBuffer: async () => {
+          getObjectBufferCalled = true;
+          return Buffer.from("should-not-be-reached");
+        },
+      };
+      const mockProcessor: any = {
+        isSupportedImageMime: () => true,
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, mockProcessor);
+
+      await assert.rejects(
+        async () => {
+          await service.transformExistingImage("unconfirmed-file-1", { width: 100 });
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.BAD_REQUEST);
+          assert.ok(err.message.includes("chưa được xác nhận"));
+          return true;
+        },
+      );
+
+      assert.strictEqual(getObjectBufferCalled, false, "getObjectBuffer must NOT be called for unconfirmed files");
+    });
+
+    test("transformExistingImage allows confirmed files", async () => {
+      let getObjectBufferCalled = false;
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "confirmed-file-1",
+          mimeType: "image/jpeg",
+          bucketKey: "images/confirmed.jpg",
+          isPublic: true,
+          isConfirmed: true,
+        }),
+      };
+      const mockR2: any = {
+        getObjectBuffer: async () => {
+          getObjectBufferCalled = true;
+          return Buffer.from("fake-jpeg-data");
+        },
+      };
+      const mockProcessor: any = {
+        isSupportedImageMime: () => true,
+        processImage: async () => ({
+          buffer: Buffer.from("transformed"),
+          info: { format: "jpeg", width: 100, height: 100, size: 50, mimeType: "image/jpeg" },
+        }),
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, mockProcessor);
+      const result = await service.transformExistingImage("confirmed-file-1", { width: 100 });
+
+      assert.strictEqual(getObjectBufferCalled, true, "getObjectBuffer must be called for confirmed files");
+      assert.ok("buffer" in result);
+    });
+  });
+
+  describe("SEC-61: unhandledRejection and uncaughtException Handlers Ensure Graceful Process Shutdown", () => {
+    test("process has listeners registered for unhandledRejection and uncaughtException", () => {
+      const rejectionListeners = process.listeners("unhandledRejection");
+      const exceptionListeners = process.listeners("uncaughtException");
+
+      assert.ok(rejectionListeners.length > 0, "Must have unhandledRejection listener registered");
+      assert.ok(exceptionListeners.length > 0, "Must have uncaughtException listener registered");
+    });
+
+    test("handleMediaShutdown gracefully executes drain and cleanup for unhandledRejection and uncaughtException", async () => {
+      resetShutdownStateForTesting();
+
+      let drainCalled = false;
+      const originalRelay = eventBus.relayPendingOutboxEvents;
+      const originalDisconnect = (prisma as any).$disconnect;
+      (eventBus as any).relayPendingOutboxEvents = async () => {
+        drainCalled = true;
+        return 0;
+      };
+      (prisma as any).$disconnect = async () => {};
+
+      try {
+        await handleMediaShutdown("unhandledRejection");
+        assert.strictEqual(drainCalled, true, "handleMediaShutdown must drain outbox events on unhandledRejection");
+      } finally {
+        (eventBus as any).relayPendingOutboxEvents = originalRelay;
+        (prisma as any).$disconnect = originalDisconnect;
+        resetShutdownStateForTesting();
       }
     });
   });

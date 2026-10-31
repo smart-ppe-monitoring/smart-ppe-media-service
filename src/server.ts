@@ -178,3 +178,22 @@ export async function handleMediaShutdown(signal: string): Promise<void> {
 
 process.on("SIGTERM", () => handleMediaShutdown("SIGTERM"));
 process.on("SIGINT", () => handleMediaShutdown("SIGINT"));
+
+// SEC-61: Handle uncaught exceptions and unhandled promise rejections with graceful shutdown
+process.on("unhandledRejection", (reason: any) => {
+  console.error("[Media Service] Unhandled Promise Rejection:", reason);
+  handleMediaShutdown("unhandledRejection").catch(() => {
+    if (!isTestEnvironment) {
+      process.exit(1);
+    }
+  });
+});
+
+process.on("uncaughtException", (error: Error) => {
+  console.error("[Media Service] Uncaught Exception:", error);
+  handleMediaShutdown("uncaughtException").catch(() => {
+    if (!isTestEnvironment) {
+      process.exit(1);
+    }
+  });
+});

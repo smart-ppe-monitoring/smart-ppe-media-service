@@ -738,6 +738,15 @@ export class FileService {
       throw new AppError("Không tìm thấy tệp tin", 404, ERROR_CODE.NOT_FOUND);
     }
 
+    // SEC-60: Chặn truy cập và biến đổi các tệp chưa hoàn tất upload hoặc chưa được xác nhận
+    if (!file.isConfirmed) {
+      throw new AppError(
+        "Tệp tin chưa hoàn tất tải lên hoặc chưa được xác nhận",
+        400,
+        ERROR_CODE.BAD_REQUEST,
+      );
+    }
+
     const effectivePerms = await this.resolveEffectivePermissions(
       userId,
       permissions,
@@ -852,6 +861,46 @@ export class FileService {
       } catch (dbErr) {
         await this.r2Service.deleteFiles([newBucketKey]).catch(() => {});
         throw dbErr;
+      }
+
+      if (typeof this.repository?.createAuditLog === "function") {
+        await this.repository
+          .createAuditLog({
+            actorId: userId,
+            action: AUDIT_ACTION.UPLOAD_FILE,
+            targetType: AUDIT_TARGET_TYPE.FILE,
+            targetId: record.id,
+            details: {
+              bucketKey: newBucketKey,
+              sourceFileId: file.id,
+              size: processed.info.size,
+              format: processed.info.format,
+              transformed: true,
+            },
+          })
+          .catch(() => {});
+      }
+
+      // SEC-59: Event-Driven Backbone - Publish file.created event and record transactional outbox
+      if (typeof this.eventBus?.publish === "function") {
+        await this.eventBus
+          .publish(EVENT_NAMES.FILE_CREATED, {
+            fileId: record.id,
+            bucketKey: record.bucketKey,
+            fileName: record.fileName,
+            mimeType: record.mimeType,
+            size: record.size,
+            userId: record.userId,
+            folder: record.folder,
+            isPublic: record.isPublic,
+            metadata: (record.metadata as any) ?? {},
+          })
+          .catch((err) => {
+            console.warn(
+              "[FileService] Failed to publish file.created event for transformed image:",
+              err?.message || err,
+            );
+          });
       }
 
       return {
