@@ -17,6 +17,8 @@ import {
   confirmUploadSchema,
   listFilesSchema,
   imageTransformSchema,
+  imageTransformQuerySchema,
+  imageTransformBodySchema,
   directImageUploadSchema,
   cleanupFilesSchema,
 } from "./file.validation";
@@ -77,16 +79,26 @@ router.get(
   controller.findById,
 );
 
-// 7. Biến đổi ảnh (resize, crop, convert format) qua Sharp
+// 7. Biến đổi ảnh on-the-fly qua Sharp (Read-only GET - RFC 7231 Safe & Idempotent)
 router.get(
   "/:id/transform",
   optionalVerifyJwtLocally,
   validate(fileIdParamSchema, "params"),
-  validate(imageTransformSchema, "query"),
+  validate(imageTransformQuerySchema, "query"),
   controller.transformImage,
 );
 
-// 8. Xin presigned download URL (dành cho file private)
+// 8. Biến đổi ảnh và lưu thành bản ghi tệp mới (Mutation POST - SEC-23: Yêu cầu JWT & Quyền FILE_UPLOAD)
+router.post(
+  "/:id/transform",
+  verifyJwtLocally,
+  requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
+  validate(fileIdParamSchema, "params"),
+  validate(imageTransformBodySchema, "body"),
+  controller.transformImage,
+);
+
+// 9. Xin presigned download URL (dành cho file private)
 router.get(
   "/:id/download-url",
   optionalVerifyJwtLocally,
@@ -94,7 +106,7 @@ router.get(
   controller.getDownloadUrl,
 );
 
-// 9. Direct download (302 redirect trực tiếp tới signed URL)
+// 10. Direct download (302 redirect trực tiếp tới signed URL)
 router.get(
   "/:id/download",
   optionalVerifyJwtLocally,
@@ -102,7 +114,7 @@ router.get(
   controller.downloadDirect,
 );
 
-// 10. Xóa tệp (yêu cầu đăng nhập và có quyền FILE_DELETE hoặc FILE_MANAGE)
+// 11. Xóa tệp (yêu cầu đăng nhập và có quyền FILE_DELETE hoặc FILE_MANAGE)
 router.delete(
   "/:id",
   verifyJwtLocally,

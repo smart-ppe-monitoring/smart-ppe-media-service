@@ -136,7 +136,12 @@ export const STORAGE_CONFIG_KEYS = {
 } as const;
 
 export const DEFAULT_ALLOWED_MIME_TYPES = [
-  "image/*",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/avif",
+  "image/gif",
+  "image/tiff",
   "application/pdf",
   "application/msword",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

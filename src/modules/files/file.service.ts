@@ -81,9 +81,23 @@ export class FileService {
     mimeType: string,
     allowedPatterns: readonly string[] | string[],
   ): boolean {
-    const lowerMime = mimeType.toLowerCase();
+    const lowerMime = mimeType.toLowerCase().trim();
+
+    // SEC-24: Chặn triệt để SVG và các định dạng XML vector có nguy cơ Stored XSS
+    const cleanMime = lowerMime.split(";")[0].trim();
+    if (
+      cleanMime === "image/svg+xml" ||
+      cleanMime === "image/svg" ||
+      cleanMime === "text/xml-svg" ||
+      cleanMime === "image/vnd.adobe.svg+xml" ||
+      cleanMime.endsWith("+xml") ||
+      cleanMime.includes("svg")
+    ) {
+      return false;
+    }
+
     return allowedPatterns.some((pattern) => {
-      const lowerPattern = pattern.toLowerCase();
+      const lowerPattern = pattern.toLowerCase().trim();
       if (lowerPattern.endsWith("/*")) {
         const prefix = lowerPattern.slice(0, -1);
         return lowerMime.startsWith(prefix);
@@ -142,7 +156,16 @@ export class FileService {
       );
     }
 
-    // 2. Kiểm tra định dạng MIME type cho phép
+    // 2. Kiểm tra định dạng MIME type và phần mở rộng cho phép (SEC-24)
+    const fileExt = path.extname(data.fileName).toLowerCase();
+    if (fileExt === ".svg" || fileExt === ".svgz") {
+      throw new AppError(
+        "Tệp định dạng SVG không được phép tải lên hệ thống vì lý do bảo mật",
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
+    }
+
     const allowedMimeTypes = [...DEFAULT_ALLOWED_MIME_TYPES];
     if (!this.isMimeTypeAllowed(data.mimeType, allowedMimeTypes)) {
       throw new AppError(

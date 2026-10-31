@@ -185,10 +185,20 @@ export class FileController {
 
   transformImage = async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const query = req.query as unknown as ImageTransformDto;
+      const isPost = Boolean(req.method && req.method.toUpperCase() === "POST");
+      const options: ImageTransformDto = isPost
+        ? {
+            ...(req.body as ImageTransformDto),
+            saveAsNew: (req.body as ImageTransformDto)?.saveAsNew ?? true,
+          }
+        : {
+            ...(req.query as unknown as ImageTransformDto),
+            saveAsNew: false, // Bắt buộc safe/idempotent theo RFC 7231 cho GET (SEC-23)
+          };
+
       const result = await this.service.transformExistingImage(
         req.params.id,
-        query,
+        options,
         req.user?.id,
         req.user?.permissions,
       );
@@ -214,7 +224,7 @@ export class FileController {
       }
 
       // Trả về bản ghi FileRecord mới
-      res.json({
+      res.status(isPost ? 201 : 200).json({
         success: true,
         message: "Biến đổi và lưu ảnh mới thành công",
         data: result,

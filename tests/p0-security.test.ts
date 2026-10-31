@@ -10,8 +10,17 @@ import { JWT_PURPOSE, JWT_ALGORITHM } from "../src/common/constants/jwt.constant
 import { ROLES } from "../src/common/constants/role.constant";
 import { PERMISSIONS } from "../src/common/constants/permission.constant";
 import { AppError } from "../src/common/errors/app-error";
+import { ERROR_CODE } from "../src/common/errors/error-code";
+import {
+  imageTransformQuerySchema,
+  imageTransformBodySchema,
+  requestUploadUrlSchema,
+} from "../src/modules/files/file.validation";
+import { DEFAULT_ALLOWED_MIME_TYPES } from "../src/common/constants/system-config.constant";
+import { FileService } from "../src/modules/files/file.service";
+import { uploadImageMiddleware } from "../src/middlewares/upload.middleware";
 
-describe("P0 Security Vulnerabilities Patch Verification (SEC-01 - SEC-04)", () => {
+describe("P0 Security Vulnerabilities Patch Verification (SEC-01 - SEC-04, SEC-23 - SEC-24)", () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -253,6 +262,224 @@ describe("P0 Security Vulnerabilities Patch Verification (SEC-01 - SEC-04)", () 
       await controller.transformImage(req, res, () => {});
 
       assert.strictEqual(headers["Cache-Control"], "public, max-age=86400, stale-while-revalidate=3600");
+    });
+  });
+
+  describe("SEC-23: Disallow state mutation and CSRF file creation via HTTP GET", () => {
+    test("imageTransformQuerySchema rejects saveAsNew=true", () => {
+      const result = imageTransformQuerySchema.safeParse({
+        width: 300,
+        height: 200,
+        saveAsNew: "true",
+      });
+      assert.strictEqual(result.success, false);
+      if (!result.success) {
+        const errorMessages = result.error.errors.map((e) => e.message);
+        assert.ok(
+          errorMessages.some((msg) =>
+            msg.includes("Không được phép lưu biến thể tệp mới qua HTTP GET"),
+          ),
+          "Must reject saveAsNew on GET schema",
+        );
+      }
+    });
+
+    test("imageTransformQuerySchema allows valid transform options and saveAsNew=false", () => {
+      const result = imageTransformQuerySchema.safeParse({
+        width: 300,
+        height: 200,
+        format: "webp",
+        saveAsNew: false,
+      });
+      assert.strictEqual(result.success, true);
+      if (result.success) {
+        assert.strictEqual(result.data.saveAsNew, false);
+        assert.strictEqual(result.data.width, 300);
+      }
+    });
+
+    test("imageTransformBodySchema allows saveAsNew=true for POST requests", () => {
+      const result = imageTransformBodySchema.safeParse({
+        width: 400,
+        height: 300,
+        format: "jpeg",
+        saveAsNew: true,
+      });
+      assert.strictEqual(result.success, true);
+      if (result.success) {
+        assert.strictEqual(result.data.saveAsNew, true);
+        assert.strictEqual(result.data.width, 400);
+      }
+    });
+
+    test("FileController.transformImage forces saveAsNew=false on HTTP GET even if query attempts it", async () => {
+      let passedOptions: any = null;
+      const mockService: any = {
+        transformExistingImage: async (_id: string, options: any) => {
+          passedOptions = options;
+          return {
+            buffer: Buffer.from("transformed-binary"),
+            info: { format: "webp", size: 18, mimeType: "image/webp" },
+            isPublic: true,
+          };
+        },
+      };
+
+      const controller = new FileController(mockService);
+      const req: any = {
+        method: "GET",
+        params: { id: "018f-image-id" },
+        query: { width: 300, saveAsNew: true },
+        user: { id: "user-1", permissions: [] },
+      };
+
+      const res: any = {
+        setHeader: () => {},
+        send: () => {},
+      };
+
+      await controller.transformImage(req, res, () => {});
+
+      assert.ok(passedOptions);
+      assert.strictEqual(passedOptions.saveAsNew, false, "GET must force saveAsNew to false");
+    });
+
+    test("FileController.transformImage allows saveAsNew=true on HTTP POST and returns 201 Created", async () => {
+      let passedOptions: any = null;
+      const createdRecord = {
+        id: "new-transformed-record-uuid",
+        fileName: "transformed_abc.webp",
+        bucketKey: "images/user-1/transformed_abc.webp",
+        isPublic: true,
+      };
+
+      const mockService: any = {
+        transformExistingImage: async (_id: string, options: any) => {
+          passedOptions = options;
+          return createdRecord;
+        },
+      };
+
+      const controller = new FileController(mockService);
+      const req: any = {
+        method: "POST",
+        params: { id: "018f-image-id" },
+        body: { width: 300, format: "webp", saveAsNew: true },
+        user: { id: "user-1", permissions: [PERMISSIONS.FILE_UPLOAD] },
+      };
+
+      let statusCode = 200;
+      let jsonResponse: any = null;
+      const res: any = {
+        status: (code: number) => {
+          statusCode = code;
+          return res;
+        },
+        json: (data: any) => {
+          jsonResponse = data;
+        },
+      };
+
+      await controller.transformImage(req, res, () => {});
+
+      assert.ok(passedOptions);
+      assert.strictEqual(passedOptions.saveAsNew, true, "POST must allow saveAsNew=true");
+      assert.strictEqual(statusCode, 201, "POST must return 201 Created status");
+      assert.strictEqual(jsonResponse.success, true);
+      assert.strictEqual(jsonResponse.data.id, "new-transformed-record-uuid");
+    });
+  });
+
+  describe("SEC-24: Prevent SVG upload leading to Stored XSS", () => {
+    test("DEFAULT_ALLOWED_MIME_TYPES excludes 'image/*' wildcard and SVG formats", () => {
+      const allowedList = DEFAULT_ALLOWED_MIME_TYPES as readonly string[];
+      assert.strictEqual(allowedList.includes("image/*"), false, "Wildcard image/* must not be present");
+      assert.strictEqual(allowedList.includes("image/svg+xml"), false, "image/svg+xml must not be in default allowed");
+      assert.strictEqual(allowedList.includes("image/svg"), false, "image/svg must not be in default allowed");
+    });
+
+    test("FileService.isMimeTypeAllowed blocks SVG variants even if wildcard image/* were configured", () => {
+      const service = new FileService({} as any, {} as any, {} as any, {} as any);
+      const isAllowed = (service as any).isMimeTypeAllowed.bind(service);
+
+      // SVG variants
+      assert.strictEqual(isAllowed("image/svg+xml", ["image/*"]), false);
+      assert.strictEqual(isAllowed("IMAGE/SVG+XML", ["image/*"]), false);
+      assert.strictEqual(isAllowed("image/svg", ["image/*"]), false);
+      assert.strictEqual(isAllowed("image/vnd.adobe.svg+xml", ["image/*"]), false);
+      assert.strictEqual(isAllowed("text/xml-svg", ["*/*"]), false);
+
+      // Safe images
+      assert.strictEqual(isAllowed("image/jpeg", ["image/*"]), true);
+      assert.strictEqual(isAllowed("image/png", ["image/*"]), true);
+      assert.strictEqual(isAllowed("image/webp", ["image/*"]), true);
+    });
+
+    test("requestUploadUrlSchema rejects SVG fileName and SVG mimeType", () => {
+      // Reject .svg extension
+      const extCheck = requestUploadUrlSchema.safeParse({
+        fileName: "malicious-vector.svg",
+        mimeType: "image/png",
+      });
+      assert.strictEqual(extCheck.success, false);
+
+      // Reject .svgz extension
+      const svgzCheck = requestUploadUrlSchema.safeParse({
+        fileName: "malicious-vector.svgz",
+        mimeType: "image/png",
+      });
+      assert.strictEqual(svgzCheck.success, false);
+
+      // Reject image/svg+xml mimeType
+      const mimeCheck = requestUploadUrlSchema.safeParse({
+        fileName: "safe-looking-name.png",
+        mimeType: "image/svg+xml",
+      });
+      assert.strictEqual(mimeCheck.success, false);
+
+      // Accept legitimate file
+      const validCheck = requestUploadUrlSchema.safeParse({
+        fileName: "profile.png",
+        mimeType: "image/png",
+      });
+      assert.strictEqual(validCheck.success, true);
+    });
+
+    test("FileService.requestUploadUrl throws AppError for SVG file", async () => {
+      const service = new FileService({} as any, {} as any, {} as any, {} as any);
+
+      await assert.rejects(
+        async () => {
+          await service.requestUploadUrl({
+            fileName: "xss-payload.svg",
+            mimeType: "image/svg+xml",
+            size: 1024,
+            isPublic: true,
+          });
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.VALIDATION_ERROR);
+          return true;
+        },
+      );
+    });
+
+    test("uploadImageMiddleware rejects files with .svg extension", (_t, done) => {
+      const fileFilter = (uploadImageMiddleware as any).fileFilter;
+      const mockFile = {
+        mimetype: "image/png", // Disguised mime type
+        originalname: "payload.svg",
+      };
+
+      fileFilter(null, mockFile, (err: any, accepted?: boolean) => {
+        assert.ok(err instanceof AppError, "Should reject with AppError");
+        assert.strictEqual(err.statusCode, 400);
+        assert.strictEqual(err.code, ERROR_CODE.VALIDATION_ERROR);
+        assert.strictEqual(accepted, undefined);
+        done();
+      });
     });
   });
 });

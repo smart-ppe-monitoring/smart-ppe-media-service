@@ -20,7 +20,8 @@ export const uploadImageMiddleware = multer({
     const isSupported = (
       SUPPORTED_IMAGE_MIME_TYPES as readonly string[]
     ).includes(file.mimetype.toLowerCase());
-    if (isSupported) {
+    const isSvgExtension = /\.svgz?$/i.test(file.originalname);
+    if (isSupported && !isSvgExtension) {
       cb(null, true);
     } else {
       cb(
