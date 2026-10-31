@@ -13,6 +13,8 @@ export const EVENT_NAMES = {
   AUTH_DEACTIVATION_REQUESTED: "auth.deactivation_requested",
   USER_SOFT_DELETED: "user.soft_deleted",
   FILE_UPLOADED_UNCONFIRMED: "file.uploaded_unconfirmed",
+  FILE_CREATED: "file.created",
+  FILE_DELETED: "file.deleted",
 
   // PPE Domain Kafka & EventBus Events
   PPE_VIOLATION_DETECTED: "ppe.violation.detected",

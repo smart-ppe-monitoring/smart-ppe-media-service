@@ -10,6 +10,9 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { r2Config } from "../../config/r2.config";
+import { AppError } from "../errors/app-error";
+import { ERROR_CODE } from "../errors/error-code";
+import { MEDIA_LIMITS } from "../constants/media.constant";
 
 export class R2Service {
   private readonly client: S3Client;
@@ -195,9 +198,14 @@ export class R2Service {
 
   /**
    * Tải Buffer tệp từ R2/S3 về bộ nhớ (dùng để xử lý biến đổi ảnh hoặc kiểm tra).
+   * Giới hạn buffer tối đa để ngăn ngừa tấn công DoS làm sập V8 Heap do cạn bộ nhớ (SEC-38).
    * @param key Đường dẫn file trong bucket
+   * @param maxBufferBytes Giới hạn dung lượng buffer tối đa cho phép (mặc định 25MB)
    */
-  async getObjectBuffer(key: string): Promise<Buffer> {
+  async getObjectBuffer(
+    key: string,
+    maxBufferBytes: number = MEDIA_LIMITS.MAX_STREAM_BUFFER_BYTES,
+  ): Promise<Buffer> {
     const command = new GetObjectCommand({
       Bucket: this.bucketName,
       Key: key,
@@ -206,13 +214,37 @@ export class R2Service {
     if (!response.Body) {
       throw new Error(`Object body is empty for key: ${key}`);
     }
-    if (typeof (response.Body as any).transformToByteArray === "function") {
-      const byteArray = await (response.Body as any).transformToByteArray();
-      return Buffer.from(byteArray);
+
+    if (
+      typeof response.ContentLength === "number" &&
+      response.ContentLength > maxBufferBytes
+    ) {
+      if (typeof (response.Body as any).destroy === "function") {
+        (response.Body as any).destroy();
+      }
+      throw new AppError(
+        `Dung lượng đối tượng (${Math.round(response.ContentLength / (1024 * 1024))}MB) vượt quá giới hạn bộ nhớ đệm cho phép (${Math.round(maxBufferBytes / (1024 * 1024))}MB)`,
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
     }
+
+    let totalBytes = 0;
     const chunks: Buffer[] = [];
-    for await (const chunk of response.Body as any) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    for await (const rawChunk of response.Body as any) {
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      totalBytes += chunk.length;
+      if (totalBytes > maxBufferBytes) {
+        if (typeof (response.Body as any).destroy === "function") {
+          (response.Body as any).destroy();
+        }
+        throw new AppError(
+          `Dung lượng luồng tệp tin (${Math.round(totalBytes / (1024 * 1024))}MB) vượt quá giới hạn bộ nhớ đệm cho phép (${Math.round(maxBufferBytes / (1024 * 1024))}MB)`,
+          400,
+          ERROR_CODE.VALIDATION_ERROR,
+        );
+      }
+      chunks.push(chunk);
     }
     return Buffer.concat(chunks);
   }

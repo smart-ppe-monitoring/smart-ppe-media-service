@@ -45,6 +45,7 @@ export const MEDIA_LIMITS = {
   MAX_DIRECT_IMAGE_BYTES: 10 * 1024 * 1024, // 10MB (SEC-11: giới hạn buffer RAM upload trực tiếp)
   UNCONFIRMED_CLEANUP_HOURS: 24,
   SOFT_DELETED_RETENTION_DAYS: 30,
+  MAX_STREAM_BUFFER_BYTES: 25 * 1024 * 1024, // 25MB (SEC-38: Giới hạn buffer tải từ S3/R2 chống V8 Heap OOM)
 } as const;
 
 export const SUPPORTED_IMAGE_MIME_TYPES = [

@@ -220,19 +220,21 @@ export class FileService {
     const uploadExpiresAt = new Date(
       Date.now() + expiresIn * 1000,
     ).toISOString();
-    await this.eventBus
-      .publish(EVENT_NAMES.FILE_UPLOADED_UNCONFIRMED, {
-        fileId: fileRecord.id,
-        key: bucketKey,
-        bucket: r2Config.bucketName || "template-be-bucket",
-        expiresAt: uploadExpiresAt,
-      })
-      .catch((err) => {
-        console.warn(
-          "[FileService] Failed to publish file.uploaded_unconfirmed event:",
-          err?.message || err,
-        );
-      });
+    if (typeof this.eventBus?.publish === "function") {
+      await this.eventBus
+        .publish(EVENT_NAMES.FILE_UPLOADED_UNCONFIRMED, {
+          fileId: fileRecord.id,
+          key: bucketKey,
+          bucket: r2Config.bucketName || "template-be-bucket",
+          expiresAt: uploadExpiresAt,
+        })
+        .catch((err) => {
+          console.warn(
+            "[FileService] Failed to publish file.uploaded_unconfirmed event:",
+            err?.message || err,
+          );
+        });
+    }
 
     await this.repository.createAuditLog({
       actorId: userId,
@@ -544,6 +546,23 @@ export class FileService {
       ipAddress: metadata?.ipAddress,
       userAgent: metadata?.userAgent,
     });
+
+    // Event-Driven Backbone: Publish file.deleted event (SEC-40)
+    if (typeof this.eventBus?.publish === "function") {
+      await this.eventBus
+        .publish(EVENT_NAMES.FILE_DELETED, {
+          fileId: file.id,
+          bucketKey: file.bucketKey,
+          deletedAt: new Date().toISOString(),
+          actorId: userId || null,
+        })
+        .catch((err) => {
+          console.warn(
+            "[FileService] Failed to publish file.deleted event:",
+            err?.message || err,
+          );
+        });
+    }
   }
 
   /**
@@ -661,6 +680,28 @@ export class FileService {
       userAgent: context?.userAgent,
     });
 
+    // Event-Driven Backbone: Publish file.created event (SEC-39)
+    if (typeof this.eventBus?.publish === "function") {
+      await this.eventBus
+        .publish(EVENT_NAMES.FILE_CREATED, {
+          fileId: record.id,
+          bucketKey: record.bucketKey,
+          fileName: record.fileName,
+          mimeType: record.mimeType,
+          size: record.size,
+          userId: record.userId,
+          folder: record.folder,
+          isPublic: record.isPublic,
+          metadata: (record.metadata as any) ?? {},
+        })
+        .catch((err) => {
+          console.warn(
+            "[FileService] Failed to publish file.created event:",
+            err?.message || err,
+          );
+        });
+    }
+
     return {
       ...record,
       url: record.isPublic
@@ -732,11 +773,14 @@ export class FileService {
       );
     }
 
-    // 2. Tải buffer ảnh gốc từ R2 an toàn
+    // 2. Tải buffer ảnh gốc từ R2 an toàn (SEC-38)
     let originalBuffer: Buffer;
     try {
       originalBuffer = await this.r2Service.getObjectBuffer(file.bucketKey);
-    } catch {
+    } catch (err: any) {
+      if (err instanceof AppError) {
+        throw err;
+      }
       throw new AppError(
         "Không tìm thấy dữ liệu tệp tin trên hệ thống lưu trữ",
         404,
@@ -848,13 +892,18 @@ export class FileService {
       Date.now() - softDeletedRetentionDays * 24 * 60 * 60 * 1000,
     );
 
-    // 1. Dọn dẹp unconfirmed files
+    // 1. Dọn dẹp unconfirmed files: Phối hợp 2 pha (2-phase cleanup) chống mồ côi (SEC-41)
     const unconfirmed =
       await this.repository.findUnconfirmedOlderThan(unconfirmedCutoff);
     let unconfirmedCleaned = 0;
     if (unconfirmed.length > 0) {
       const keys = unconfirmed.map((f) => f.bucketKey);
       const ids = unconfirmed.map((f) => f.id);
+
+      // Phase 1: Đánh dấu CLEANUP_PENDING (cô lập trạng thái trong CSDL trước khi xóa storage)
+      await this.repository.markCleanupPending(ids);
+
+      // Phase 2: Xóa blobs vật lý khỏi R2
       let r2Success = true;
       try {
         await this.r2Service.deleteFiles(keys);
@@ -865,6 +914,8 @@ export class FileService {
           err?.message || err,
         );
       }
+
+      // Phase 3: Hoàn tất hard delete bản ghi trong CSDL sau khi R2 xóa thành công
       if (r2Success) {
         const res = await this.repository.hardDeleteMany(ids);
         unconfirmedCleaned = res.count;

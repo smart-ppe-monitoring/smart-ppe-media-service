@@ -395,6 +395,20 @@ export class FileRepository {
     });
   }
 
+  /**
+   * Đánh dấu các bản ghi là CLEANUP_PENDING (soft-delete / cô lập) trong CSDL trước khi xóa blob lưu trữ vật lý (SEC-41).
+   * Ngăn chặn người dùng đọc hoặc kích hoạt bản ghi trong thời gian dọn dẹp và chống mất tính nhất quán nếu tiến trình bị gián đoạn.
+   */
+  markCleanupPending(ids: string[]) {
+    if (!ids || ids.length === 0) return Promise.resolve({ count: 0 });
+    return prisma.fileRecord.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        deletedAt: new Date(),
+      },
+    });
+  }
+
   hardDeleteMany(ids: string[]) {
     if (!ids || ids.length === 0) return Promise.resolve({ count: 0 });
     return prisma.fileRecord.deleteMany({

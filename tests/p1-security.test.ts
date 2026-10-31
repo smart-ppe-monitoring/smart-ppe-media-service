@@ -32,7 +32,9 @@ import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
 import { ROLES } from "../src/common/constants/role.constant";
 import { PERMISSIONS } from "../src/common/constants/permission.constant";
+import { EVENT_NAMES } from "../src/common/constants/event.constant";
 import { MEDIA_LIMITS } from "../src/common/constants/media.constant";
+import { R2Service } from "../src/common/services/r2.service";
 import { uploadImageMiddleware } from "../src/middlewares/upload.middleware";
 import { requireAnyPermission } from "../src/middlewares/permission.middleware";
 import fileRouter from "../src/modules/files/file.route";
@@ -45,7 +47,7 @@ import {
 } from "../src/server";
 import { eventBus } from "../src/common/services/event-bus.service";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-30)", { concurrency: false }, () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-41)", { concurrency: false }, () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -877,6 +879,264 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-30)", { c
 
       await service.listFiles({}, "admin-id", [], ROLES.ADMIN);
       assert.strictEqual(passedCanManageAll, true);
+    });
+  });
+
+  describe("SEC-38: Unchecked S3 Object Stream Concatenation Triggers V8 Heap OOM DoS", () => {
+    test("R2Service.getObjectBuffer rejects when ContentLength exceeds maxBufferBytes", async () => {
+      const r2Service = new R2Service();
+      (r2Service as any).client = {
+        send: async () => ({
+          ContentLength: 30 * 1024 * 1024, // 30MB
+          Body: {
+            destroy: () => {},
+            async *[Symbol.asyncIterator]() {
+              yield Buffer.alloc(1024);
+            },
+          },
+        }),
+      };
+
+      await assert.rejects(
+        async () => {
+          await r2Service.getObjectBuffer("test-key", 25 * 1024 * 1024);
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.VALIDATION_ERROR);
+          assert.ok(err.message.includes("vượt quá giới hạn bộ nhớ đệm cho phép"));
+          return true;
+        },
+      );
+    });
+
+    test("R2Service.getObjectBuffer rejects when stream chunks accumulate beyond limit", async () => {
+      const r2Service = new R2Service();
+      let streamDestroyed = false;
+      (r2Service as any).client = {
+        send: async () => ({
+          Body: {
+            destroy: () => {
+              streamDestroyed = true;
+            },
+            async *[Symbol.asyncIterator]() {
+              yield Buffer.alloc(10 * 1024);
+              yield Buffer.alloc(10 * 1024);
+              yield Buffer.alloc(10 * 1024); // Total 30KB > 25KB
+            },
+          },
+        }),
+      };
+
+      await assert.rejects(
+        async () => {
+          await r2Service.getObjectBuffer("test-key", 25 * 1024);
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.VALIDATION_ERROR);
+          assert.ok(err.message.includes("vượt quá giới hạn bộ nhớ đệm cho phép"));
+          assert.strictEqual(streamDestroyed, true);
+          return true;
+        },
+      );
+    });
+
+    test("R2Service.getObjectBuffer succeeds when stream is within maxBufferBytes", async () => {
+      const r2Service = new R2Service();
+      (r2Service as any).client = {
+        send: async () => ({
+          ContentLength: 4,
+          Body: {
+            async *[Symbol.asyncIterator]() {
+              yield Buffer.from("test");
+            },
+          },
+        }),
+      };
+
+      const buf = await r2Service.getObjectBuffer("test-key", 1024);
+      assert.strictEqual(buf.toString(), "test");
+    });
+
+    test("FileService.transformExistingImage propagates AppError when storage buffer exceeds limit", async () => {
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "img-1",
+          mimeType: "image/jpeg",
+          bucketKey: "images/img-1.jpg",
+          isPublic: true,
+        }),
+      };
+      const mockR2: any = {
+        getObjectBuffer: async () => {
+          throw new AppError("Dung lượng tệp tin vượt quá giới hạn bộ nhớ đệm cho phép", 400, ERROR_CODE.VALIDATION_ERROR);
+        },
+      };
+      const mockProcessor: any = {
+        isSupportedImageMime: () => true,
+      };
+      const service = new FileService(mockRepo, mockR2, {} as any, mockProcessor);
+
+      await assert.rejects(
+        async () => {
+          await service.transformExistingImage("img-1", {});
+        },
+        (err: any) => {
+          assert.ok(err instanceof AppError);
+          assert.strictEqual(err.statusCode, 400);
+          assert.strictEqual(err.code, ERROR_CODE.VALIDATION_ERROR);
+          assert.ok(err.message.includes("vượt quá giới hạn bộ nhớ đệm"));
+          return true;
+        },
+      );
+    });
+  });
+
+  describe("SEC-39: Direct Image Upload Endpoint Dispatches Domain Event for AI Inspection", () => {
+    test("FileService.uploadAndProcessImage publishes file.created event upon successful direct upload", async () => {
+      let publishedEventName = "";
+      let publishedPayload: any = null;
+
+      const mockRepo: any = {
+        createDirectFile: async (data: any) => ({
+          id: "direct-file-1",
+          userId: data.userId,
+          fileName: data.fileName,
+          originalName: data.originalName,
+          mimeType: data.mimeType,
+          size: data.size,
+          bucketKey: data.bucketKey,
+          folder: data.folder,
+          isPublic: data.isPublic,
+          metadata: data.metadata,
+        }),
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        uploadBuffer: async () => {},
+        getPublicUrl: () => "https://r2/img.webp",
+      };
+
+      const mockEventBus: any = {
+        publish: async (name: string, payload: any) => {
+          publishedEventName = name;
+          publishedPayload = payload;
+        },
+      };
+
+      const mockProcessor: any = {
+        processImage: async () => ({
+          buffer: Buffer.from("webp-data"),
+          info: { format: "webp", width: 800, height: 600, size: 2048, mimeType: "image/webp" },
+        }),
+      };
+
+      const service = new FileService(mockRepo, mockR2, mockEventBus, mockProcessor);
+
+      const result = await service.uploadAndProcessImage(
+        {
+          buffer: Buffer.from("fake-jpg"),
+          originalname: "inspection.jpg",
+          mimetype: "image/jpeg",
+          size: 5000,
+        },
+        { folder: "inspections", isPublic: true },
+        "safety-officer-1",
+        [PERMISSIONS.FILE_UPLOAD],
+      );
+
+      assert.strictEqual(result.id, "direct-file-1");
+      assert.strictEqual(publishedEventName, EVENT_NAMES.FILE_CREATED);
+      assert.strictEqual(publishedPayload.fileId, "direct-file-1");
+      assert.strictEqual(publishedPayload.fileName, result.fileName);
+      assert.strictEqual(publishedPayload.mimeType, "image/webp");
+      assert.strictEqual(publishedPayload.size, 2048);
+    });
+  });
+
+  describe("SEC-40: File Deletion Pipeline Dispatches file.deleted Domain Event", () => {
+    test("FileService.deleteFile publishes file.deleted event with metadata", async () => {
+      let publishedEventName = "";
+      let publishedPayload: any = null;
+
+      const mockRepo: any = {
+        findById: async () => ({
+          id: "file-to-delete-1",
+          userId: "user-1",
+          bucketKey: "images/user-1/evidence.png",
+          fileName: "evidence.png",
+        }),
+        delete: async () => {},
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        deleteFile: async () => {},
+      };
+
+      const mockEventBus: any = {
+        publish: async (name: string, payload: any) => {
+          publishedEventName = name;
+          publishedPayload = payload;
+        },
+      };
+
+      const service = new FileService(mockRepo, mockR2, mockEventBus, {} as any);
+
+      await service.deleteFile(
+        "file-to-delete-1",
+        "user-1",
+        [PERMISSIONS.FILE_DELETE],
+      );
+
+      assert.strictEqual(publishedEventName, EVENT_NAMES.FILE_DELETED);
+      assert.strictEqual(publishedPayload.fileId, "file-to-delete-1");
+      assert.strictEqual(publishedPayload.bucketKey, "images/user-1/evidence.png");
+      assert.strictEqual(publishedPayload.actorId, "user-1");
+      assert.ok(publishedPayload.deletedAt);
+    });
+  });
+
+  describe("SEC-41: Two-Phase Cleanup Coordinates Database and Storage Deletion", () => {
+    test("FileService.cleanupOrphanFiles executes markCleanupPending before R2 deletion and hardDeleteMany after", async () => {
+      const callSequence: string[] = [];
+
+      const mockRepo: any = {
+        findUnconfirmedOlderThan: async () => [
+          { id: "unconfirmed-1", bucketKey: "orphans/unconfirmed-1.bin" },
+        ],
+        markCleanupPending: async (ids: string[]) => {
+          callSequence.push(`markCleanupPending:${ids.join(",")}`);
+          return { count: ids.length };
+        },
+        hardDeleteMany: async (ids: string[]) => {
+          callSequence.push(`hardDeleteMany:${ids.join(",")}`);
+          return { count: ids.length };
+        },
+        findSoftDeletedOlderThan: async () => [],
+        createAuditLog: async () => {},
+      };
+
+      const mockR2: any = {
+        deleteFiles: async (keys: string[]) => {
+          callSequence.push(`r2DeleteFiles:${keys.join(",")}`);
+          return { deleted: keys, errors: [] };
+        },
+      };
+
+      const service = new FileService(mockRepo, mockR2, {} as any, {} as any);
+
+      const result = await service.cleanupOrphanFiles(24, 30);
+      assert.strictEqual(result.unconfirmedCleaned, 1);
+      assert.deepStrictEqual(callSequence, [
+        "markCleanupPending:unconfirmed-1",
+        "r2DeleteFiles:orphans/unconfirmed-1.bin",
+        "hardDeleteMany:unconfirmed-1",
+      ]);
     });
   });
 });

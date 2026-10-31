@@ -57,6 +57,25 @@ export interface FileUploadedUnconfirmedPayload {
   expiresAt: string | Date;
 }
 
+export interface FileCreatedPayload {
+  fileId: string;
+  bucketKey: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  userId?: string | null;
+  folder: string;
+  isPublic: boolean;
+  metadata?: Record<string, any>;
+}
+
+export interface FileDeletedPayload {
+  fileId: string;
+  bucketKey: string;
+  deletedAt: string | Date;
+  actorId?: string | null;
+}
+
 import type {
   PPEViolationDetectedPayload,
   PPEIncidentResolvedPayload,
@@ -88,6 +107,8 @@ export interface EventPayloadMap {
   "auth.deactivation_requested": DeactivationRequestedPayload;
   "user.soft_deleted": UserSoftDeletedPayload;
   "file.uploaded_unconfirmed": FileUploadedUnconfirmedPayload;
+  "file.created": FileCreatedPayload;
+  "file.deleted": FileDeletedPayload;
   "ppe.violation.detected": PPEViolationDetectedPayload;
   "ppe.incident.created": PPEIncidentCreatedPayload;
   "ppe.incident.assigned": PPEIncidentAssignedPayload;
