@@ -94,20 +94,50 @@ export class JwtKeyService {
       }
     }
 
-    // Kiểm tra tính hợp lệ của cặp khóa RSA (tránh crash OpenSSL do cấu hình lỗi)
-    let keysValid = false;
-    if (privateKey && publicKey) {
+    // Kiểm tra tính hợp lệ của Public Key và Private Key riêng biệt
+    let pubKeyValid = false;
+    if (publicKey) {
       try {
-        crypto.createPrivateKey(privateKey);
         crypto.createPublicKey(publicKey);
-        keysValid = true;
+        pubKeyValid = true;
       } catch {
-        keysValid = false;
+        pubKeyValid = false;
       }
     }
 
-    // Nếu chưa có khóa hoặc khóa không hợp lệ: Tự động sinh cặp khóa RSA 2048-bit an toàn
-    if (!keysValid) {
+    let privKeyValid = false;
+    if (privateKey) {
+      try {
+        crypto.createPrivateKey(privateKey);
+        privKeyValid = true;
+      } catch {
+        privKeyValid = false;
+      }
+    }
+
+    // Nếu có private key nhưng chưa có public key, tự động trích xuất public key từ private key
+    if (privKeyValid && !pubKeyValid) {
+      try {
+        const pubKeyObj = crypto.createPublicKey(privateKey);
+        publicKey = pubKeyObj
+          .export({ type: "spki", format: "pem" })
+          .toString()
+          .trim();
+        pubKeyValid = true;
+      } catch {
+        pubKeyValid = false;
+      }
+    }
+
+    // SEC-37: Chặn tự động sinh cặp khóa RSA ngẫu nhiên trong production làm phá vỡ kiến trúc Auth phi tập trung
+    if (!pubKeyValid) {
+      if (envConfig.nodeEnv === "production") {
+        throw new Error(
+          "FATAL: Trusted JWT Public Key not found or invalid in production environment. Decentralized authentication cannot function.",
+        );
+      }
+
+      // Trong môi trường development / test: chỉ sinh khóa tạm thời nếu không tìm thấy bất kỳ public key nào
       const { publicKey: generatedPub, privateKey: generatedPriv } =
         crypto.generateKeyPairSync("rsa", {
           modulusLength: 2048,
@@ -117,9 +147,11 @@ export class JwtKeyService {
 
       privateKey = generatedPriv.trim();
       publicKey = generatedPub.trim();
+      privKeyValid = true;
+      pubKeyValid = true;
     }
 
-    this.privateKeyPem = privateKey;
+    this.privateKeyPem = privKeyValid ? privateKey : "";
     this.publicKeyPem = publicKey;
   }
 
@@ -237,6 +269,13 @@ export class JwtKeyService {
     options?: jwt.SignOptions,
   ): string {
     if (this.algorithm === JWT_ALGORITHM.RS256) {
+      if (!this.privateKeyPem) {
+        throw new AppError(
+          "RSA Private Key không được cấu hình trên satellite microservice",
+          500,
+          ERROR_CODE.INTERNAL_SERVER_ERROR,
+        );
+      }
       return jwt.sign(payload, this.privateKeyPem, {
         algorithm: JWT_ALGORITHM.RS256,
         keyid: this.keyId,

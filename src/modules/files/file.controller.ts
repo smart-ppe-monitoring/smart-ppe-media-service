@@ -28,6 +28,7 @@ export class FileController {
           ipAddress: req.ip,
           userAgent: req.headers["user-agent"],
         },
+        req.user?.role,
       );
 
       res.status(201).json({
@@ -49,6 +50,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         { ipAddress: req.ip, userAgent: req.headers["user-agent"] },
+        req.user?.role,
       );
 
       res.json({
@@ -67,6 +69,8 @@ export class FileController {
         req.params.id,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       res.json({
@@ -84,6 +88,8 @@ export class FileController {
         req.params.id,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       res.json({
@@ -101,6 +107,8 @@ export class FileController {
         req.params.id,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       res.redirect(302, result.downloadUrl);
@@ -120,6 +128,7 @@ export class FileController {
         query,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
       );
 
       res.json({
@@ -138,6 +147,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         { ipAddress: req.ip, userAgent: req.headers["user-agent"] },
+        req.user?.role,
       );
 
       res.json({
@@ -171,6 +181,7 @@ export class FileController {
         req.user?.id,
         req.user?.permissions,
         { ipAddress: req.ip, userAgent: req.headers["user-agent"] },
+        req.user?.role,
       );
 
       res.status(201).json({
@@ -185,27 +196,48 @@ export class FileController {
 
   transformImage = async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const query = req.query as unknown as ImageTransformDto;
+      const isPost = Boolean(req.method && req.method.toUpperCase() === "POST");
+      const options: ImageTransformDto = isPost
+        ? {
+            ...(req.body as ImageTransformDto),
+            saveAsNew: (req.body as ImageTransformDto)?.saveAsNew ?? true,
+          }
+        : {
+            ...(req.query as unknown as ImageTransformDto),
+            saveAsNew: false, // Bắt buộc safe/idempotent theo RFC 7231 cho GET (SEC-23)
+          };
+
       const result = await this.service.transformExistingImage(
         req.params.id,
-        query,
+        options,
         req.user?.id,
         req.user?.permissions,
+        req.user?.role,
+        { ipAddress: req.ip, userAgent: req.headers?.["user-agent"] },
       );
 
       // Nếu trả về buffer binary trực tiếp
       if ("buffer" in result && Buffer.isBuffer(result.buffer)) {
         res.setHeader("Content-Type", result.info.mimeType);
         res.setHeader("Content-Length", result.info.size);
-        res.setHeader(
-          "Cache-Control",
-          "public, max-age=86400, stale-while-revalidate=3600",
-        );
+        if (result.isPublic) {
+          res.setHeader(
+            "Cache-Control",
+            "public, max-age=86400, stale-while-revalidate=3600",
+          );
+        } else {
+          res.setHeader(
+            "Cache-Control",
+            "private, no-cache, no-store, must-revalidate",
+          );
+          res.setHeader("Pragma", "no-cache");
+          res.setHeader("Expires", "0");
+        }
         return res.send(result.buffer);
       }
 
       // Trả về bản ghi FileRecord mới
-      res.json({
+      res.status(isPost ? 201 : 200).json({
         success: true,
         message: "Biến đổi và lưu ảnh mới thành công",
         data: result,

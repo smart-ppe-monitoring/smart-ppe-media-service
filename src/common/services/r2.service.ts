@@ -4,26 +4,113 @@ import {
   DeleteObjectsCommand,
   PutObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   ListObjectsV2CommandOutput,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { r2Config } from "../../config/r2.config";
+import { envConfig } from "../../config/env.config";
+import { AppError } from "../errors/app-error";
+import { ERROR_CODE } from "../errors/error-code";
+import { MEDIA_LIMITS } from "../constants/media.constant";
+
+export interface R2ServiceOptions {
+  endpoint?: string;
+  bucketName?: string;
+  region?: string;
+  forcePathStyle?: boolean;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+}
 
 export class R2Service {
   private readonly client: S3Client;
   private readonly bucketName: string;
+  private readonly endpoint: string;
 
-  constructor() {
-    this.bucketName = r2Config.bucketName;
+  constructor(options?: R2ServiceOptions) {
+    // SEC-21: Support S3_ENDPOINT, PPE_MINIO_ENDPOINT, and local MinIO overrides
+    const explicitS3Endpoint =
+      options?.endpoint ||
+      (process.env.S3_ENDPOINT && process.env.S3_ENDPOINT.trim().length > 0
+        ? process.env.S3_ENDPOINT.trim()
+        : envConfig.s3?.endpoint && envConfig.s3.endpoint.trim().length > 0 && envConfig.s3.endpoint !== "http://localhost:9000"
+          ? envConfig.s3.endpoint.trim()
+          : undefined);
+
+    const r2AccountId = (r2Config.accountId || "").trim();
+
+    let endpoint: string;
+    let forcePathStyle = false;
+    let region = "auto";
+    let accessKeyId = options?.accessKeyId || r2Config.accessKeyId;
+    let secretAccessKey = options?.secretAccessKey || r2Config.secretAccessKey;
+
+    if (explicitS3Endpoint) {
+      endpoint = explicitS3Endpoint;
+      forcePathStyle = options?.forcePathStyle ?? true;
+      region = options?.region || process.env.S3_REGION || envConfig.s3?.region || "us-east-1";
+      accessKeyId =
+        accessKeyId ||
+        process.env.S3_ACCESS_KEY ||
+        envConfig.s3?.accessKeyId ||
+        envConfig.minio?.accessKeyId ||
+        "minio_admin";
+      secretAccessKey =
+        secretAccessKey ||
+        process.env.S3_SECRET_KEY ||
+        envConfig.s3?.secretAccessKey ||
+        envConfig.minio?.secretAccessKey ||
+        "minio_admin_secret";
+    } else if (r2AccountId.length > 0) {
+      endpoint = `https://${r2AccountId}.r2.cloudflarestorage.com`;
+      forcePathStyle = options?.forcePathStyle ?? false;
+      region = options?.region || "auto";
+    } else {
+      endpoint = envConfig.minio?.endpoint || process.env.PPE_MINIO_ENDPOINT || "http://localhost:9000";
+      forcePathStyle = options?.forcePathStyle ?? (envConfig.minio?.forcePathStyle ?? true);
+      region = options?.region || "us-east-1";
+      accessKeyId =
+        accessKeyId ||
+        process.env.S3_ACCESS_KEY ||
+        envConfig.s3?.accessKeyId ||
+        envConfig.minio?.accessKeyId ||
+        "minio_admin";
+      secretAccessKey =
+        secretAccessKey ||
+        process.env.S3_SECRET_KEY ||
+        envConfig.s3?.secretAccessKey ||
+        envConfig.minio?.secretAccessKey ||
+        "minio_admin_secret";
+    }
+
+    this.endpoint = endpoint;
+    this.bucketName =
+      options?.bucketName ||
+      r2Config.bucketName ||
+      process.env.S3_BUCKET ||
+      envConfig.s3?.bucket ||
+      envConfig.minio?.bucketEvidences ||
+      "smart-ppe-evidence";
+
     this.client = new S3Client({
-      region: "auto",
-      endpoint: `https://${r2Config.accountId}.r2.cloudflarestorage.com`,
+      region,
+      endpoint: this.endpoint,
+      forcePathStyle,
       credentials: {
-        accessKeyId: r2Config.accessKeyId,
-        secretAccessKey: r2Config.secretAccessKey,
+        accessKeyId: accessKeyId || "minio_admin",
+        secretAccessKey: secretAccessKey || "minio_admin_secret",
       },
     });
+  }
+
+  getEndpoint(): string {
+    return this.endpoint;
+  }
+
+  getBucketName(): string {
+    return this.bucketName;
   }
 
   /**
@@ -80,12 +167,16 @@ export class R2Service {
   }
 
   /**
-   * Lấy URL public truy cập file trên R2.
+   * Lấy URL public truy cập file trên R2 hoặc MinIO/S3.
    * @param key Đường dẫn file trong bucket
    */
   getPublicUrl(key: string): string {
-    const base = r2Config.publicBaseUrl.replace(/\/$/, "");
-    return `${base}/${key}`;
+    if (r2Config.publicBaseUrl && r2Config.publicBaseUrl.trim().length > 0) {
+      const base = r2Config.publicBaseUrl.replace(/\/$/, "");
+      return `${base}/${key}`;
+    }
+    const base = this.endpoint.replace(/\/$/, "");
+    return `${base}/${this.bucketName}/${key}`;
   }
 
   /**
@@ -153,6 +244,7 @@ export class R2Service {
 
   /**
    * Xóa hàng loạt file khỏi R2 theo batch (tối đa 1000 files/lần gọi theo chuẩn S3).
+   * Kiểm tra và bắt buộc xử lý lỗi response.Errors để chống rò rỉ blobs mồ côi (SEC-48).
    * @param keys Danh sách đường dẫn file trong bucket
    */
   async deleteFiles(keys: string[]): Promise<void> {
@@ -167,7 +259,18 @@ export class R2Service {
           Quiet: true,
         },
       });
-      await this.client.send(command);
+      const response = await this.client.send(command);
+      if (response.Errors && response.Errors.length > 0) {
+        const errorDetails = response.Errors.map(
+          (err) =>
+            `${err.Key ?? "unknown"}: ${err.Code ?? "Unknown"} (${err.Message ?? ""})`,
+        ).join(", ");
+        throw new AppError(
+          `S3 batch deletion partial failure (${response.Errors.length} objects failed): ${errorDetails}`,
+          500,
+          ERROR_CODE.INTERNAL_SERVER_ERROR,
+        );
+      }
     }
   }
 
@@ -194,9 +297,14 @@ export class R2Service {
 
   /**
    * Tải Buffer tệp từ R2/S3 về bộ nhớ (dùng để xử lý biến đổi ảnh hoặc kiểm tra).
+   * Giới hạn buffer tối đa để ngăn ngừa tấn công DoS làm sập V8 Heap do cạn bộ nhớ (SEC-38).
    * @param key Đường dẫn file trong bucket
+   * @param maxBufferBytes Giới hạn dung lượng buffer tối đa cho phép (mặc định 25MB)
    */
-  async getObjectBuffer(key: string): Promise<Buffer> {
+  async getObjectBuffer(
+    key: string,
+    maxBufferBytes: number = MEDIA_LIMITS.MAX_STREAM_BUFFER_BYTES,
+  ): Promise<Buffer> {
     const command = new GetObjectCommand({
       Bucket: this.bucketName,
       Key: key,
@@ -205,14 +313,71 @@ export class R2Service {
     if (!response.Body) {
       throw new Error(`Object body is empty for key: ${key}`);
     }
-    if (typeof (response.Body as any).transformToByteArray === "function") {
-      const byteArray = await (response.Body as any).transformToByteArray();
-      return Buffer.from(byteArray);
+
+    if (
+      typeof response.ContentLength === "number" &&
+      response.ContentLength > maxBufferBytes
+    ) {
+      if (typeof (response.Body as any).destroy === "function") {
+        (response.Body as any).destroy();
+      }
+      throw new AppError(
+        `Dung lượng đối tượng (${Math.round(response.ContentLength / (1024 * 1024))}MB) vượt quá giới hạn bộ nhớ đệm cho phép (${Math.round(maxBufferBytes / (1024 * 1024))}MB)`,
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
     }
+
+    let totalBytes = 0;
     const chunks: Buffer[] = [];
-    for await (const chunk of response.Body as any) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    for await (const rawChunk of response.Body as any) {
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      totalBytes += chunk.length;
+      if (totalBytes > maxBufferBytes) {
+        if (typeof (response.Body as any).destroy === "function") {
+          (response.Body as any).destroy();
+        }
+        throw new AppError(
+          `Dung lượng luồng tệp tin (${Math.round(totalBytes / (1024 * 1024))}MB) vượt quá giới hạn bộ nhớ đệm cho phép (${Math.round(maxBufferBytes / (1024 * 1024))}MB)`,
+          400,
+          ERROR_CODE.VALIDATION_ERROR,
+        );
+      }
+      chunks.push(chunk);
     }
     return Buffer.concat(chunks);
   }
+
+  /**
+   * Lấy metadata đối tượng từ R2/S3 để xác thực sự tồn tại, dung lượng thực tế và content-type (SEC-05).
+   * @param key Đường dẫn file trong bucket
+   */
+  async headObject(
+    key: string,
+  ): Promise<{ size: number; contentType?: string; exists: boolean }> {
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+      });
+      const response = await this.client.send(command);
+      return {
+        size: response.ContentLength ?? 0,
+        contentType: response.ContentType,
+        exists: true,
+      };
+    } catch (err: any) {
+      if (
+        err.name === "NotFound" ||
+        err.$metadata?.httpStatusCode === 404 ||
+        err.message?.includes("404") ||
+        err.Code === "NoSuchKey"
+      ) {
+        return { size: 0, exists: false };
+      }
+      throw err;
+    }
+  }
 }
+
+export const r2Service = new R2Service();

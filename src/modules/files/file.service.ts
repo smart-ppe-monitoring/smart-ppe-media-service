@@ -5,6 +5,7 @@ import { FileRepository, fileRepository } from "./file.repository";
 import { R2Service } from "../../common/services/r2.service";
 import { AppError } from "../../common/errors/app-error";
 import { ERROR_CODE } from "../../common/errors/error-code";
+import { ROLES } from "../../common/constants/role.constant";
 import { PERMISSIONS } from "../../common/constants/permission.constant";
 import {
   AUDIT_ACTION,
@@ -16,6 +17,7 @@ import {
   DEFAULT_ALLOWED_MIME_TYPES,
 } from "../../common/constants/system-config.constant";
 import { r2Config } from "../../config/r2.config";
+import { envConfig } from "../../config/env.config";
 import {
   RequestUploadUrlDto,
   UploadUrlResponseDto,
@@ -63,7 +65,18 @@ export class FileService {
   private async resolveEffectivePermissions(
     userId?: string,
     permissions?: string[],
+    role?: string,
   ): Promise<string[]> {
+    // SEC-30: Đồng bộ quyền quản trị viên khi role là ADMIN dù permissions rỗng hoặc dùng wildcard
+    if (role === ROLES.ADMIN || role === "ADMIN") {
+      return [
+        PERMISSIONS.FILE_READ,
+        PERMISSIONS.FILE_UPLOAD,
+        PERMISSIONS.FILE_MANAGE,
+        PERMISSIONS.FILE_DELETE,
+        ...(permissions || []),
+      ];
+    }
     if (permissions && permissions.length > 0) {
       return permissions;
     }
@@ -81,9 +94,23 @@ export class FileService {
     mimeType: string,
     allowedPatterns: readonly string[] | string[],
   ): boolean {
-    const lowerMime = mimeType.toLowerCase();
+    const lowerMime = mimeType.toLowerCase().trim();
+
+    // SEC-24: Chặn triệt để SVG và các định dạng XML vector có nguy cơ Stored XSS
+    const cleanMime = lowerMime.split(";")[0].trim();
+    if (
+      cleanMime === "image/svg+xml" ||
+      cleanMime === "image/svg" ||
+      cleanMime === "text/xml-svg" ||
+      cleanMime === "image/vnd.adobe.svg+xml" ||
+      cleanMime.endsWith("+xml") ||
+      cleanMime.includes("svg")
+    ) {
+      return false;
+    }
+
     return allowedPatterns.some((pattern) => {
-      const lowerPattern = pattern.toLowerCase();
+      const lowerPattern = pattern.toLowerCase().trim();
       if (lowerPattern.endsWith("/*")) {
         const prefix = lowerPattern.slice(0, -1);
         return lowerMime.startsWith(prefix);
@@ -112,14 +139,18 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     metadata?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<UploadUrlResponseDto> {
-    // Kiểm tra quyền FILE_UPLOAD nếu là người dùng đã đăng nhập
+    // Kiểm tra quyền FILE_UPLOAD nếu là người dùng đã đăng nhập (SEC-30: hỗ trợ vai trò ADMIN)
     if (userId) {
       const userPermissions = await this.resolveEffectivePermissions(
         userId,
         permissions,
+        role,
       );
       const canUpload =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
         userPermissions.includes(PERMISSIONS.FILE_UPLOAD) ||
         userPermissions.includes(PERMISSIONS.FILE_MANAGE);
       if (!canUpload) {
@@ -142,7 +173,16 @@ export class FileService {
       );
     }
 
-    // 2. Kiểm tra định dạng MIME type cho phép
+    // 2. Kiểm tra định dạng MIME type và phần mở rộng cho phép (SEC-24)
+    const fileExt = path.extname(data.fileName).toLowerCase();
+    if (fileExt === ".svg" || fileExt === ".svgz") {
+      throw new AppError(
+        "Tệp định dạng SVG không được phép tải lên hệ thống vì lý do bảo mật",
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
+    }
+
     const allowedMimeTypes = [...DEFAULT_ALLOWED_MIME_TYPES];
     if (!this.isMimeTypeAllowed(data.mimeType, allowedMimeTypes)) {
       throw new AppError(
@@ -159,6 +199,13 @@ export class FileService {
     const folder = data.folder || "general";
     const bucketKey = `${folder}/${userId || "anonymous"}/${uuidv7()}_${sanitizedName}`;
 
+    // SEC-65: Generate S3 presigned URL before inserting database record to prevent orphan DB row leaks if S3 fails
+    const uploadUrl = await this.r2Service.getPresignedUploadUrl(
+      bucketKey,
+      data.mimeType,
+      expiresIn,
+    );
+
     const fileRecord = await this.repository.create({
       userId,
       originalName: data.fileName,
@@ -171,29 +218,35 @@ export class FileService {
       metadata: (data.metadata ?? Prisma.JsonNull) as Prisma.InputJsonValue,
     });
 
-    const uploadUrl = await this.r2Service.getPresignedUploadUrl(
-      bucketKey,
-      data.mimeType,
-      expiresIn,
-    );
-
     // Event-Driven Backbone: Publish file.uploaded_unconfirmed event
     const uploadExpiresAt = new Date(
       Date.now() + expiresIn * 1000,
     ).toISOString();
-    await this.eventBus
-      .publish(EVENT_NAMES.FILE_UPLOADED_UNCONFIRMED, {
-        fileId: fileRecord.id,
-        key: bucketKey,
-        bucket: r2Config.bucketName || "template-be-bucket",
-        expiresAt: uploadExpiresAt,
-      })
-      .catch((err) => {
-        console.warn(
-          "[FileService] Failed to publish file.uploaded_unconfirmed event:",
-          err?.message || err,
-        );
-      });
+    if (typeof this.eventBus?.publish === "function") {
+      // SEC-62: Resolve bucket dynamically from r2Service or config without hardcoded template-be-bucket fallback
+      const targetBucket =
+        (typeof this.r2Service.getBucketName === "function"
+          ? this.r2Service.getBucketName()
+          : undefined) ||
+        r2Config.bucketName ||
+        envConfig.s3?.bucket ||
+        envConfig.minio?.bucketEvidences ||
+        "smart-ppe-evidence";
+
+      await this.eventBus
+        .publish(EVENT_NAMES.FILE_UPLOADED_UNCONFIRMED, {
+          fileId: fileRecord.id,
+          key: bucketKey,
+          bucket: targetBucket,
+          expiresAt: uploadExpiresAt,
+        })
+        .catch((err) => {
+          console.warn(
+            "[FileService] Failed to publish file.uploaded_unconfirmed event:",
+            err?.message || err,
+          );
+        });
+    }
 
     await this.repository.createAuditLog({
       actorId: userId,
@@ -224,6 +277,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     metadata?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<FileResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -241,8 +295,12 @@ export class FileService {
     const userPermissions = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      userPermissions.includes(PERMISSIONS.FILE_MANAGE);
     // CRIT-01 Fix: File anonymous (userId === null) không được tự động match với caller; chỉ admin (FILE_MANAGE) mới có thể xác nhận
     const isOwner = Boolean(file.userId && userId && file.userId === userId);
 
@@ -254,27 +312,41 @@ export class FileService {
       );
     }
 
-    // Kiểm tra dung lượng xác nhận với cấu hình hệ thống
-    if (data?.size) {
-      const maxFileSizeMb = 100;
-      const maxSizeBytes = maxFileSizeMb * 1024 * 1024;
-      if (data.size > maxSizeBytes) {
-        throw new AppError(
-          `Dung lượng tệp vượt quá giới hạn cấu hình cho phép (${maxFileSizeMb}MB)`,
-          400,
-          ERROR_CODE.VALIDATION_ERROR,
-        );
-      }
+    // SEC-05: Xác thực sự tồn tại của tệp và lấy dung lượng thực tế từ Object Storage qua HeadObject
+    const headInfo = await this.r2Service.headObject(file.bucketKey);
+    if (!headInfo.exists) {
+      throw new AppError(
+        "Tệp tin chưa được tải lên hệ thống lưu trữ R2/S3",
+        400,
+        ERROR_CODE.NOT_FOUND,
+      );
     }
 
-    const updated = await this.repository.confirmUpload(id, data?.size);
+    const actualSize = headInfo.size;
+    const maxFileSizeMb = 100;
+    const maxSizeBytes = maxFileSizeMb * 1024 * 1024;
+    if (actualSize > maxSizeBytes) {
+      throw new AppError(
+        `Dung lượng tệp thực tế (${Math.round(actualSize / 1024 / 1024)}MB) vượt quá giới hạn cấu hình cho phép (${maxFileSizeMb}MB)`,
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
+    }
+
+    // Sử dụng kích thước thực tế từ HeadObject thay vì tin cậy dữ liệu client gửi lên
+    const finalSize = actualSize > 0 ? actualSize : (data?.size ?? file.size);
+    const updated = await this.repository.confirmUpload(id, finalSize);
 
     await this.repository.createAuditLog({
       actorId: userId,
       action: AUDIT_ACTION.CONFIRM_FILE_UPLOAD,
       targetType: AUDIT_TARGET_TYPE.FILE,
       targetId: id,
-      details: { bucketKey: file.bucketKey, size: data.size },
+      details: {
+        bucketKey: file.bucketKey,
+        size: finalSize,
+        reportedSize: data?.size,
+      },
       ipAddress: metadata?.ipAddress,
       userAgent: metadata?.userAgent,
     });
@@ -291,10 +363,43 @@ export class FileService {
     id: string,
     userId?: string,
     permissions?: string[],
+    role?: string,
+    metadata?: { ipAddress?: string; userAgent?: string },
   ): Promise<FileResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
       throw new AppError("Tệp không tồn tại", 404, ERROR_CODE.FILE_NOT_FOUND);
+    }
+
+    // SEC-55: Enforce isConfirmed verification and strict ownership check
+    // Unconfirmed files must not expose internal storage keys and metadata to unauthorized callers
+    if (file.isConfirmed === false) {
+      if (!userId) {
+        throw new AppError(
+          "Tệp chưa được xác nhận hoàn tất tải lên",
+          400,
+          ERROR_CODE.BAD_REQUEST,
+        );
+      }
+
+      const userPermissions = await this.resolveEffectivePermissions(
+        userId,
+        permissions,
+        role,
+      );
+      const canManageAll =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
+        userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+      const isOwner = Boolean(file.userId && userId && file.userId === userId);
+
+      if (!isOwner && !canManageAll) {
+        throw new AppError(
+          "Tệp chưa được xác nhận hoàn tất tải lên",
+          400,
+          ERROR_CODE.BAD_REQUEST,
+        );
+      }
     }
 
     if (!file.isPublic) {
@@ -309,9 +414,13 @@ export class FileService {
       const userPermissions = await this.resolveEffectivePermissions(
         userId,
         permissions,
+        role,
       );
-      const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
-      const isOwner = file.userId === userId;
+      const canManageAll =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
+        userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+      const isOwner = Boolean(file.userId && userId && file.userId === userId);
 
       if (!isOwner && !canManageAll) {
         throw new AppError(
@@ -322,11 +431,29 @@ export class FileService {
       }
     }
 
+    // SEC-32: Audit logging for sensitive media read operations
+    if (typeof this.repository?.createAuditLog === "function") {
+      await this.repository.createAuditLog({
+        actorId: userId,
+        action: AUDIT_ACTION.READ_FILE,
+        targetType: AUDIT_TARGET_TYPE.FILE,
+        targetId: file.id,
+        details: {
+          bucketKey: file.bucketKey,
+          fileName: file.fileName,
+          isPublic: file.isPublic,
+        },
+        ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+      });
+    }
+
     return {
       ...file,
-      url: file.isPublic
-        ? this.r2Service.getPublicUrl(file.bucketKey)
-        : undefined,
+      url:
+        file.isPublic && file.isConfirmed
+          ? this.r2Service.getPublicUrl(file.bucketKey)
+          : undefined,
     };
   }
 
@@ -334,6 +461,8 @@ export class FileService {
     id: string,
     userId?: string,
     permissions?: string[],
+    role?: string,
+    metadata?: { ipAddress?: string; userAgent?: string },
   ): Promise<DownloadUrlResponseDto> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -360,8 +489,12 @@ export class FileService {
       const userPermissions = await this.resolveEffectivePermissions(
         userId,
         permissions,
+        role,
       );
-      const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+      const canManageAll =
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
+        userPermissions.includes(PERMISSIONS.FILE_MANAGE);
       const isOwner = file.userId === userId;
 
       if (!isOwner && !canManageAll) {
@@ -381,6 +514,23 @@ export class FileService {
       file.originalName,
     );
 
+    // SEC-32: Audit logging for sensitive media presigned download URL generation
+    if (typeof this.repository?.createAuditLog === "function") {
+      await this.repository.createAuditLog({
+        actorId: userId,
+        action: AUDIT_ACTION.DOWNLOAD_FILE,
+        targetType: AUDIT_TARGET_TYPE.FILE,
+        targetId: file.id,
+        details: {
+          bucketKey: file.bucketKey,
+          fileName: file.originalName,
+          isPublic: file.isPublic,
+        },
+        ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+      });
+    }
+
     return {
       downloadUrl,
       expiresIn,
@@ -392,12 +542,17 @@ export class FileService {
     query: FileQueryDto,
     userId?: string,
     permissions?: string[],
+    role?: string,
   ) {
     const userPermissions = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      userPermissions.includes(PERMISSIONS.FILE_MANAGE);
 
     const result =
       query.search?.trim() && typeof this.repository.searchFts === "function"
@@ -422,6 +577,7 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     metadata?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<void> {
     const file = await this.repository.findById(id);
     if (!file) {
@@ -431,9 +587,14 @@ export class FileService {
     const userPermissions = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = userPermissions.includes(PERMISSIONS.FILE_MANAGE);
-    const isOwner = (file.userId ?? null) === (userId ?? null);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      userPermissions.includes(PERMISSIONS.FILE_MANAGE);
+    // SEC-20: Do not treat null actor and null uploader as matching. Explicitly require both IDs to match.
+    const isOwner = Boolean(userId && file.userId && file.userId === userId);
     const hasDeletePermission = userPermissions.includes(
       PERMISSIONS.FILE_DELETE,
     );
@@ -446,15 +607,9 @@ export class FileService {
       );
     }
 
-    // Xóa file khỏi R2 bucket
-    await this.r2Service.deleteFile(file.bucketKey).catch((err) => {
-      console.warn(
-        `[FileService] Failed to delete file ${file.bucketKey} from R2:`,
-        err.message,
-      );
-    });
-
-    // Soft delete bản ghi trong database
+    // SEC-18: Bảo lưu binary trên R2 trong suốt thời hạn 30 ngày (soft-delete retention).
+    // Tuyệt đối không xóa physical storage object tại đây; việc xóa vĩnh viễn trên R2
+    // sẽ do cleanupOrphanFiles thực thi sau khi đã hết hạn lưu trữ 30 ngày.
     await this.repository.delete(id);
 
     await this.repository.createAuditLog({
@@ -466,6 +621,23 @@ export class FileService {
       ipAddress: metadata?.ipAddress,
       userAgent: metadata?.userAgent,
     });
+
+    // Event-Driven Backbone: Publish file.deleted event (SEC-40)
+    if (typeof this.eventBus?.publish === "function") {
+      await this.eventBus
+        .publish(EVENT_NAMES.FILE_DELETED, {
+          fileId: file.id,
+          bucketKey: file.bucketKey,
+          deletedAt: new Date().toISOString(),
+          actorId: userId || null,
+        })
+        .catch((err) => {
+          console.warn(
+            "[FileService] Failed to publish file.deleted event:",
+            err?.message || err,
+          );
+        });
+    }
   }
 
   /**
@@ -482,12 +654,16 @@ export class FileService {
     userId?: string,
     permissions?: string[],
     context?: { ipAddress?: string; userAgent?: string },
+    role?: string,
   ): Promise<FileResponseDto> {
     const effectivePerms = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
     const canUpload =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
       effectivePerms.includes(PERMISSIONS.FILE_UPLOAD) ||
       effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
 
@@ -548,7 +724,8 @@ export class FileService {
         size: processed.info.size,
         bucketKey,
         folder,
-        isPublic: options.isPublic ?? true,
+        // SEC-22: Secure defaults: Default isPublic to false instead of true
+        isPublic: options.isPublic ?? false,
         metadata: {
           width: processed.info.width,
           height: processed.info.height,
@@ -579,6 +756,28 @@ export class FileService {
       userAgent: context?.userAgent,
     });
 
+    // Event-Driven Backbone: Publish file.created event (SEC-39)
+    if (typeof this.eventBus?.publish === "function") {
+      await this.eventBus
+        .publish(EVENT_NAMES.FILE_CREATED, {
+          fileId: record.id,
+          bucketKey: record.bucketKey,
+          fileName: record.fileName,
+          mimeType: record.mimeType,
+          size: record.size,
+          userId: record.userId,
+          folder: record.folder,
+          isPublic: record.isPublic,
+          metadata: (record.metadata as any) ?? {},
+        })
+        .catch((err) => {
+          console.warn(
+            "[FileService] Failed to publish file.created event:",
+            err?.message || err,
+          );
+        });
+    }
+
     return {
       ...record,
       url: record.isPublic
@@ -595,6 +794,8 @@ export class FileService {
     options: ImageTransformDto = {},
     userId?: string,
     permissions?: string[],
+    role?: string,
+    metadata?: { ipAddress?: string; userAgent?: string },
   ): Promise<
     | {
         buffer: Buffer;
@@ -605,6 +806,7 @@ export class FileService {
           size: number;
           mimeType: string;
         };
+        isPublic?: boolean;
       }
     | FileResponseDto
   > {
@@ -613,11 +815,24 @@ export class FileService {
       throw new AppError("Không tìm thấy tệp tin", 404, ERROR_CODE.NOT_FOUND);
     }
 
+    // SEC-60: Chặn truy cập và biến đổi các tệp chưa hoàn tất upload hoặc chưa được xác nhận
+    if (!file.isConfirmed) {
+      throw new AppError(
+        "Tệp tin chưa hoàn tất tải lên hoặc chưa được xác nhận",
+        400,
+        ERROR_CODE.BAD_REQUEST,
+      );
+    }
+
     const effectivePerms = await this.resolveEffectivePermissions(
       userId,
       permissions,
+      role,
     );
-    const canManageAll = effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
+    const canManageAll =
+      role === ROLES.ADMIN ||
+      role === "ADMIN" ||
+      effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
     const isOwner = Boolean(file.userId && userId && file.userId === userId);
 
     if (!file.isPublic && !isOwner && !canManageAll) {
@@ -644,11 +859,14 @@ export class FileService {
       );
     }
 
-    // 2. Tải buffer ảnh gốc từ R2 an toàn
+    // 2. Tải buffer ảnh gốc từ R2 an toàn (SEC-38)
     let originalBuffer: Buffer;
     try {
       originalBuffer = await this.r2Service.getObjectBuffer(file.bucketKey);
-    } catch {
+    } catch (err: any) {
+      if (err instanceof AppError) {
+        throw err;
+      }
       throw new AppError(
         "Không tìm thấy dữ liệu tệp tin trên hệ thống lưu trữ",
         404,
@@ -676,6 +894,9 @@ export class FileService {
       }
 
       const canUpload =
+        canManageAll ||
+        role === ROLES.ADMIN ||
+        role === "ADMIN" ||
         effectivePerms.includes(PERMISSIONS.FILE_UPLOAD) ||
         effectivePerms.includes(PERMISSIONS.FILE_MANAGE);
       if (!canUpload) {
@@ -719,6 +940,46 @@ export class FileService {
         throw dbErr;
       }
 
+      if (typeof this.repository?.createAuditLog === "function") {
+        await this.repository
+          .createAuditLog({
+            actorId: userId,
+            action: AUDIT_ACTION.UPLOAD_FILE,
+            targetType: AUDIT_TARGET_TYPE.FILE,
+            targetId: record.id,
+            details: {
+              bucketKey: newBucketKey,
+              sourceFileId: file.id,
+              size: processed.info.size,
+              format: processed.info.format,
+              transformed: true,
+            },
+          })
+          .catch(() => {});
+      }
+
+      // SEC-59: Event-Driven Backbone - Publish file.created event and record transactional outbox
+      if (typeof this.eventBus?.publish === "function") {
+        await this.eventBus
+          .publish(EVENT_NAMES.FILE_CREATED, {
+            fileId: record.id,
+            bucketKey: record.bucketKey,
+            fileName: record.fileName,
+            mimeType: record.mimeType,
+            size: record.size,
+            userId: record.userId,
+            folder: record.folder,
+            isPublic: record.isPublic,
+            metadata: (record.metadata as any) ?? {},
+          })
+          .catch((err) => {
+            console.warn(
+              "[FileService] Failed to publish file.created event for transformed image:",
+              err?.message || err,
+            );
+          });
+      }
+
       return {
         ...record,
         url: record.isPublic
@@ -727,7 +988,30 @@ export class FileService {
       };
     }
 
-    return processed;
+    // SEC-32: Audit logging for on-the-fly image transformations
+    if (typeof this.repository?.createAuditLog === "function") {
+      await this.repository.createAuditLog({
+        actorId: userId,
+        action: AUDIT_ACTION.TRANSFORM_IMAGE,
+        targetType: AUDIT_TARGET_TYPE.FILE,
+        targetId: file.id,
+        details: {
+          bucketKey: file.bucketKey,
+          width: options.width,
+          height: options.height,
+          fit: options.fit,
+          format: options.format,
+          quality: options.quality,
+        },
+        ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+      });
+    }
+
+    return {
+      ...processed,
+      isPublic: file.isPublic,
+    };
   }
 
   /**
@@ -738,6 +1022,15 @@ export class FileService {
     softDeletedRetentionDays = MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS,
     actorContext?: { actorId?: string; ipAddress?: string; userAgent?: string },
   ): Promise<CleanupResultDto> {
+    // SEC-29: Chặn tiêu hủy bằng chứng kiểm toán bằng cách bắt buộc softDeletedRetentionDays tối thiểu 30 ngày
+    if (softDeletedRetentionDays < MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS) {
+      throw new AppError(
+        `Thời gian lưu giữ tệp đã xóa mềm tối thiểu là ${MEDIA_LIMITS.SOFT_DELETED_RETENTION_DAYS} ngày để bảo vệ bằng chứng kiểm toán`,
+        400,
+        ERROR_CODE.VALIDATION_ERROR,
+      );
+    }
+
     const unconfirmedCutoff = new Date(
       Date.now() - unconfirmedMaxAgeHours * 60 * 60 * 1000,
     );
@@ -745,13 +1038,18 @@ export class FileService {
       Date.now() - softDeletedRetentionDays * 24 * 60 * 60 * 1000,
     );
 
-    // 1. Dọn dẹp unconfirmed files
+    // 1. Dọn dẹp unconfirmed files: Phối hợp 2 pha (2-phase cleanup) chống mồ côi (SEC-41)
     const unconfirmed =
       await this.repository.findUnconfirmedOlderThan(unconfirmedCutoff);
     let unconfirmedCleaned = 0;
     if (unconfirmed.length > 0) {
       const keys = unconfirmed.map((f) => f.bucketKey);
       const ids = unconfirmed.map((f) => f.id);
+
+      // Phase 1: Đánh dấu CLEANUP_PENDING (cô lập trạng thái trong CSDL trước khi xóa storage)
+      await this.repository.markCleanupPending(ids);
+
+      // Phase 2: Xóa blobs vật lý khỏi R2
       let r2Success = true;
       try {
         await this.r2Service.deleteFiles(keys);
@@ -762,6 +1060,8 @@ export class FileService {
           err?.message || err,
         );
       }
+
+      // Phase 3: Hoàn tất hard delete bản ghi trong CSDL sau khi R2 xóa thành công
       if (r2Success) {
         const res = await this.repository.hardDeleteMany(ids);
         unconfirmedCleaned = res.count;

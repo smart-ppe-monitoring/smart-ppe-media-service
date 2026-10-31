@@ -14,7 +14,7 @@ model FileRecord {
   originalName String    @map("original_name")
   fileName     String    @map("file_name")
   mimeType     String    @map("mime_type")
-  size         Int       @default(0)
+  size         BigInt    @default(0)
   bucketKey    String    @unique @map("bucket_key")
   folder       String    @default("general")
   isPublic     Boolean   @default(false) @map("is_public")
@@ -28,6 +28,7 @@ model FileRecord {
   @@index([folder, isPublic])
   @@index([isConfirmed, createdAt])
   @@index([deletedAt])
+  // Note: Functional GIN index "idx_file_records_fts" on to_tsvector('simple', ...) is managed via migration for PostgreSQL Full-Text Search (SEC-26)
   @@map("file_records")
 }
 
@@ -62,6 +63,7 @@ model OutboxEvent {
   updatedAt   DateTime  @updatedAt @map("updated_at")
 
   @@index([status, createdAt])
+  @@index([status, updatedAt])
   @@index([eventType])
   @@map("outbox_events")
 }

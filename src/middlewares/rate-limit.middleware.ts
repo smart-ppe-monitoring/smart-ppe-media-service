@@ -49,6 +49,23 @@ export function getSharedRateLimitRedisClient(): IORedis | null {
 }
 
 /**
+ * Chuẩn hóa route prefix để chống chia tách rate limit buckets (SEC-25).
+ * Các route dual-mount như /api/v1/files và /files chia sẻ chung bucket "/api/v1/files",
+ * ngăn chặn kẻ tấn công gọi xen kẽ giữa hai tiền tố để tiêu thụ x2 hạn mức yêu cầu.
+ */
+export function normalizeRateLimitPrefix(req: Request): string {
+  const prefix =
+    req.baseUrl ||
+    (req.originalUrl ? req.originalUrl.split("?")[0] : "") ||
+    req.path ||
+    "";
+  if (prefix.startsWith("/files") || prefix.startsWith("/api/v1/files")) {
+    return "/api/v1/files";
+  }
+  return prefix;
+}
+
+/**
  * Factory tạo Rate Limiter Middleware hỗ trợ Redis phân tán (cho cluster/multi-pod)
  * và tự động fallback về in-memory sliding-window nếu Redis chưa sẵn sàng.
  * Trả về HTTP headers chuẩn RFC 6585 (Retry-After, X-RateLimit-*).
@@ -80,7 +97,7 @@ export function createRateLimiter(options: RateLimitOptions = {}) {
     next: NextFunction,
   ): void | Promise<void> => {
     const clientIp = req.ip || req.socket.remoteAddress || "unknown";
-    const routePrefix = req.baseUrl || req.path || "";
+    const routePrefix = normalizeRateLimitPrefix(req);
     const key = options.keyGenerator
       ? options.keyGenerator(req)
       : `${clientIp}:${routePrefix}`;
@@ -236,4 +253,18 @@ export const authRateLimitMiddleware = createRateLimiter({
   windowMs: envConfig.rateLimit.authWindowMs,
   maxRequests: envConfig.rateLimit.authMaxRequests,
   message: "Too many authentication attempts, please try again later",
+});
+
+/**
+ * Rate Limiter nghiêm ngặt dành riêng cho các tác vụ xử lý và biến đổi ảnh CPU-intensive qua Sharp (SEC-35)
+ * Cấu hình động từ SHARP_RATE_LIMIT_MAX_REQUESTS & SHARP_RATE_LIMIT_WINDOW_MS
+ */
+export const sharpRateLimitMiddleware = createRateLimiter({
+  windowMs: envConfig.rateLimit.sharpWindowMs ?? 60000,
+  maxRequests: envConfig.rateLimit.sharpMaxRequests ?? 30,
+  message: "Too many image processing requests, please try again later",
+  keyGenerator: (req) => {
+    const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+    return `sharp:${clientIp}`;
+  },
 });

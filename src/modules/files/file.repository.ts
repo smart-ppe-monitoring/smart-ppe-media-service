@@ -5,7 +5,8 @@ import {
   calculatePaginationSkip,
   formatPaginationMeta,
 } from "../../common/helpers/pagination.helper";
-import { buildTsQuery } from "../../common/helpers/fts.helper";
+import { buildTsQuery, escapeSqlLike } from "../../common/helpers/fts.helper";
+import { isUuid } from "../../common/helpers/uuid.helper";
 
 const fileSelect = {
   id: true,
@@ -23,25 +24,38 @@ const fileSelect = {
   updatedAt: true,
 } satisfies Prisma.FileRecordSelect;
 
+/**
+ * Biểu thức tính tsvector chuẩn hóa phục vụ Full-Text Search trên bảng file_records.
+ * Biểu thức này khớp chính xác 100% với GIN index `idx_file_records_fts` trong CSDL PostgreSQL (SEC-26),
+ * cho phép PostgreSQL thực thi Bitmap Index Scan thay vì Seq Scan trên toàn bộ bảng.
+ */
+export const FILE_RECORDS_FTS_VECTOR_EXPR = Prisma.sql`to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, ''))`;
+
 export class FileRepository {
-  create(data: {
+  private db: any;
+
+  constructor(dbClient: any = prisma) {
+    this.db = dbClient;
+  }
+
+  async create(data: {
     userId?: string | null;
     originalName: string;
     fileName: string;
     mimeType: string;
-    size?: number;
+    size?: number | bigint;
     bucketKey: string;
     folder?: string;
     isPublic?: boolean;
     metadata?: Prisma.InputJsonValue;
   }) {
-    return prisma.fileRecord.create({
+    const record = await this.db.fileRecord.create({
       data: {
         userId: data.userId,
         originalName: data.originalName,
         fileName: data.fileName,
         mimeType: data.mimeType,
-        size: data.size ?? 0,
+        size: data.size !== undefined ? BigInt(data.size) : BigInt(0),
         bucketKey: data.bucketKey,
         folder: data.folder ?? "general",
         isPublic: data.isPublic ?? false,
@@ -50,31 +64,35 @@ export class FileRepository {
       },
       select: fileSelect,
     });
+    return { ...record, size: Number(record.size) };
   }
 
-  findById(id: string) {
-    return prisma.fileRecord.findFirst({
+  async findById(id: string) {
+    const record = await this.db.fileRecord.findFirst({
       where: { id, deletedAt: null },
       select: fileSelect,
     });
+    return record ? { ...record, size: Number(record.size) } : null;
   }
 
-  findByBucketKey(bucketKey: string) {
-    return prisma.fileRecord.findUnique({
+  async findByBucketKey(bucketKey: string) {
+    const record = await this.db.fileRecord.findUnique({
       where: { bucketKey },
       select: fileSelect,
     });
+    return record ? { ...record, size: Number(record.size) } : null;
   }
 
-  confirmUpload(id: string, size?: number) {
-    return prisma.fileRecord.update({
+  async confirmUpload(id: string, size?: number | bigint) {
+    const updated = await this.db.fileRecord.update({
       where: { id },
       data: {
         isConfirmed: true,
-        ...(size !== undefined ? { size } : {}),
+        ...(size !== undefined ? { size: BigInt(size) } : {}),
       },
       select: fileSelect,
     });
+    return { ...updated, size: Number(updated.size) };
   }
 
   async findAll(
@@ -156,8 +174,13 @@ export class FileRepository {
       prisma.fileRecord.count({ where }),
     ]);
 
+    const mappedData = data.map((f) => ({
+      ...f,
+      size: Number(f.size),
+    }));
+
     return {
-      data,
+      data: mappedData,
       meta: formatPaginationMeta(safePage, safeLimit, total),
     };
   }
@@ -191,11 +214,12 @@ export class FileRepository {
     const whereConditions: Prisma.Sql[] = [
       Prisma.sql`f.deleted_at IS NULL`,
       Prisma.sql`f.is_confirmed = true`,
-      Prisma.sql`to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, '')) @@ to_tsquery('simple', ${tsQuery})`,
+      Prisma.sql`${FILE_RECORDS_FTS_VECTOR_EXPR} @@ to_tsquery('simple', ${tsQuery})`,
     ];
 
     if (!canManageAll) {
-      if (currentUserId) {
+      // SEC-42: Validate UUID format to prevent PostgreSQL 22P02 syntax cast crashes on non-UUID subjects
+      if (currentUserId && isUuid(currentUserId)) {
         whereConditions.push(
           Prisma.sql`(f.is_public = true OR f.user_id = ${currentUserId}::uuid)`,
         );
@@ -203,7 +227,12 @@ export class FileRepository {
         whereConditions.push(Prisma.sql`f.is_public = true`);
       }
     } else if (query.userId) {
-      whereConditions.push(Prisma.sql`f.user_id = ${query.userId}::uuid`);
+      if (isUuid(query.userId)) {
+        whereConditions.push(Prisma.sql`f.user_id = ${query.userId}::uuid`);
+      } else {
+        // query.userId is non-UUID: return 0 results safely without throwing 22P02 exception
+        whereConditions.push(Prisma.sql`1 = 0`);
+      }
     }
 
     if (query.folder) {
@@ -215,72 +244,98 @@ export class FileRepository {
     }
 
     if (query.mimeType) {
+      // SEC-54: Escape SQL LIKE wildcards (%, _, \) to prevent wildcard injection in MIME filter
+      const escapedMime = escapeSqlLike(query.mimeType);
       whereConditions.push(
-        Prisma.sql`f.mime_type LIKE ${query.mimeType + "%"}`,
+        Prisma.sql`f.mime_type LIKE ${escapedMime + "%"} ESCAPE '\\'`,
       );
     }
 
     const whereClause = Prisma.sql`WHERE ${Prisma.join(whereConditions, " AND ")}`;
 
-    const [rawFiles, countResult] = await prisma.$transaction([
-      prisma.$queryRaw<
-        Array<{
-          id: string;
-          user_id: string | null;
-          original_name: string;
-          file_name: string;
-          mime_type: string;
-          size: number;
-          bucket_key: string;
-          folder: string;
-          is_public: boolean;
-          is_confirmed: boolean;
-          metadata: unknown;
-          created_at: Date;
-          updated_at: Date;
-          rank: number;
-        }>
-      >`
-        SELECT
-          f.id, f.user_id, f.original_name, f.file_name, f.mime_type,
-          f.size, f.bucket_key, f.folder, f.is_public, f.is_confirmed,
-          f.metadata, f.created_at, f.updated_at,
-          ts_rank(to_tsvector('simple', coalesce(f.original_name, '') || ' ' || coalesce(f.file_name, '') || ' ' || coalesce(f.folder, '')), to_tsquery('simple', ${tsQuery})) as rank
-        FROM file_records f
-        ${whereClause}
-        ORDER BY rank DESC, f.created_at DESC
-        OFFSET ${skip}
-        LIMIT ${take}
-      `,
-      prisma.$queryRaw<Array<{ count: bigint }>>`
-        SELECT COUNT(*)::bigint as count
-        FROM file_records f
-        ${whereClause}
-      `,
-    ]);
+    try {
+      const [rawFiles, countResult] = await prisma.$transaction([
+        prisma.$queryRaw<
+          Array<{
+            id: string;
+            user_id: string | null;
+            original_name: string;
+            file_name: string;
+            mime_type: string;
+            size: number;
+            bucket_key: string;
+            folder: string;
+            is_public: boolean;
+            is_confirmed: boolean;
+            metadata: unknown;
+            created_at: Date;
+            updated_at: Date;
+            rank: number;
+          }>
+        >`
+          SELECT
+            f.id, f.user_id, f.original_name, f.file_name, f.mime_type,
+            f.size, f.bucket_key, f.folder, f.is_public, f.is_confirmed,
+            f.metadata, f.created_at, f.updated_at,
+            ts_rank(${FILE_RECORDS_FTS_VECTOR_EXPR}, to_tsquery('simple', ${tsQuery})) as rank
+          FROM file_records f
+          ${whereClause}
+          ORDER BY rank DESC, f.created_at DESC
+          OFFSET ${skip}
+          LIMIT ${take}
+        `,
+        prisma.$queryRaw<Array<{ count: bigint }>>`
+          SELECT COUNT(*)::bigint as count
+          FROM file_records f
+          ${whereClause}
+        `,
+      ]);
 
-    const total = Number(countResult[0]?.count ?? 0);
-    const data = rawFiles.map((f) => ({
-      id: f.id,
-      userId: f.user_id,
-      originalName: f.original_name,
-      fileName: f.file_name,
-      mimeType: f.mime_type,
-      size: f.size,
-      bucketKey: f.bucket_key,
-      folder: f.folder,
-      isPublic: f.is_public,
-      isConfirmed: f.is_confirmed,
-      metadata: f.metadata,
-      createdAt: f.created_at,
-      updatedAt: f.updated_at,
-      user: f.user_id ? { id: f.user_id, fullName: null } : null,
-    }));
+      const total = Number(countResult[0]?.count ?? 0);
+      const data = rawFiles.map((f) => ({
+        id: f.id,
+        userId: f.user_id,
+        originalName: f.original_name,
+        fileName: f.file_name,
+        mimeType: f.mime_type,
+        size: f.size,
+        bucketKey: f.bucket_key,
+        folder: f.folder,
+        isPublic: f.is_public,
+        isConfirmed: f.is_confirmed,
+        metadata: f.metadata,
+        createdAt: f.created_at,
+        updatedAt: f.updated_at,
+        user: f.user_id ? { id: f.user_id, fullName: null } : null,
+      }));
 
-    return {
-      data,
-      meta: formatPaginationMeta(safePage, safeLimit, total),
-    };
+      return {
+        data,
+        meta: formatPaginationMeta(safePage, safeLimit, total),
+      };
+    } catch (err: any) {
+      // SEC-13: Chặn lỗi cú pháp FTS 42601 hoặc ngoại lệ truy vấn thô to_tsquery
+      // làm sập HTTP 500; fallback an toàn về tìm kiếm tiêu chuẩn findAll
+      console.warn(
+        `[FileRepository] Full-Text Search query failed (${err?.code || err?.message}), falling back to standard findAll.`,
+      );
+      return this.findAll(query, currentUserId, canManageAll);
+    }
+  }
+
+  /**
+   * Đảm bảo chỉ mục GIN cho Full-Text Search tồn tại trên bảng file_records (SEC-26).
+   */
+  async ensureFtsIndex(): Promise<void> {
+    try {
+      await prisma.$executeRawUnsafe(`
+        CREATE INDEX IF NOT EXISTS "idx_file_records_fts" ON "file_records" USING gin (
+          to_tsvector('simple', coalesce("original_name", '') || ' ' || coalesce("file_name", '') || ' ' || coalesce("folder", ''))
+        );
+      `);
+    } catch {
+      // Ignored when offline or in test environments
+    }
   }
 
   async delete(id: string) {
@@ -315,24 +370,24 @@ export class FileRepository {
     });
   }
 
-  createDirectFile(data: {
+  async createDirectFile(data: {
     userId?: string | null;
     originalName: string;
     fileName: string;
     mimeType: string;
-    size: number;
+    size: number | bigint;
     bucketKey: string;
     folder?: string;
     isPublic?: boolean;
     metadata?: Prisma.InputJsonValue;
   }) {
-    return prisma.fileRecord.create({
+    const record = await this.db.fileRecord.create({
       data: {
         userId: data.userId,
         originalName: data.originalName,
         fileName: data.fileName,
         mimeType: data.mimeType,
-        size: data.size,
+        size: BigInt(data.size),
         bucketKey: data.bucketKey,
         folder: data.folder ?? "general",
         isPublic: data.isPublic ?? false,
@@ -341,6 +396,7 @@ export class FileRepository {
       },
       select: fileSelect,
     });
+    return { ...record, size: Number(record.size) };
   }
 
   findUnconfirmedOlderThan(cutoff: Date, limit = 100) {
@@ -373,10 +429,43 @@ export class FileRepository {
     });
   }
 
+  /**
+   * Đánh dấu các bản ghi là CLEANUP_PENDING (soft-delete / cô lập) trong CSDL trước khi xóa blob lưu trữ vật lý (SEC-41).
+   * Ngăn chặn người dùng đọc hoặc kích hoạt bản ghi trong thời gian dọn dẹp và chống mất tính nhất quán nếu tiến trình bị gián đoạn.
+   */
+  markCleanupPending(ids: string[]) {
+    if (!ids || ids.length === 0) return Promise.resolve({ count: 0 });
+    return prisma.fileRecord.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        deletedAt: new Date(),
+      },
+    });
+  }
+
   hardDeleteMany(ids: string[]) {
     if (!ids || ids.length === 0) return Promise.resolve({ count: 0 });
     return prisma.fileRecord.deleteMany({
       where: { id: { in: ids } },
+    });
+  }
+
+  /**
+   * SEC-63: Tìm danh sách tệp thuộc người dùng phục vụ xóa dữ liệu theo GDPR Article 17
+   */
+  findByUserId(userId: string) {
+    return prisma.fileRecord.findMany({
+      where: { userId },
+      select: { id: true, bucketKey: true },
+    });
+  }
+
+  /**
+   * SEC-63: Xóa vĩnh viễn toàn bộ bản ghi tệp của người dùng theo GDPR Article 17
+   */
+  deleteByUserId(userId: string) {
+    return prisma.fileRecord.deleteMany({
+      where: { userId },
     });
   }
 }

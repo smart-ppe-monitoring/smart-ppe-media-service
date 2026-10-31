@@ -9,7 +9,10 @@ import {
 } from "./middlewares/error.middleware";
 import fileRoute from "./modules/files/file.route";
 import { rateLimitMiddleware } from "./middlewares/rate-limit.middleware";
-import { requestIdMiddleware } from "./middlewares/request-id.middleware";
+import {
+  requestIdMiddleware,
+  requireGatewayOrigin,
+} from "./middlewares/request-id.middleware";
 import { maintenanceGuard } from "./middlewares/maintenance.middleware";
 import { envConfig } from "./config/env.config";
 import { buildOpenApiSpec } from "./config/openapi/openapi.registry";
@@ -17,6 +20,13 @@ import { registerFileOpenApi } from "./modules/files/file.openapi";
 
 // Khởi tạo các định nghĩa OpenAPI
 registerFileOpenApi();
+
+// SEC-45: Đảm bảo JSON.stringify tuần tự hóa an toàn kiểu dữ liệu BigInt sang số nguyên chuẩn
+if (typeof (BigInt.prototype as any).toJSON !== "function") {
+  (BigInt.prototype as any).toJSON = function () {
+    return Number(this);
+  };
+}
 
 /**
  * Express Application cho Media & File Storage Microservice (Phase 6: Second Satellite Service)
@@ -44,7 +54,8 @@ mediaApp.use(
         imgSrc: ["'self'", "data:", "https:", "blob:"],
       },
     },
-    crossOriginResourcePolicy: { policy: "cross-origin" },
+    // SEC-53: Restrict Cross-Origin Resource Policy to same-origin to prevent unauthorized third-party embedding/hotlinking
+    crossOriginResourcePolicy: { policy: "same-origin" },
   }),
 );
 
@@ -80,8 +91,10 @@ const corsOptions: cors.CorsOptions = {
 };
 mediaApp.use(cors(corsOptions));
 mediaApp.use(morgan(envConfig.nodeEnv === "production" ? "combined" : "dev"));
-mediaApp.use(express.json({ limit: "20mb" }));
-mediaApp.use(express.urlencoded({ extended: true, limit: "20mb" }));
+// SEC-44: Restrict global body parsers to 100kb to prevent V8 Event Loop starvation and JSON ReDoS.
+// Direct file uploads stream via Multer multipart or direct S3/R2 presigned URLs.
+mediaApp.use(express.json({ limit: "100kb" }));
+mediaApp.use(express.urlencoded({ extended: true, limit: "100kb" }));
 mediaApp.use(cookieParser());
 
 // 3. Health check endpoints cho Traefik Gateway & Monitoring
@@ -105,13 +118,21 @@ if (envConfig.nodeEnv !== "production") {
 }
 
 // 4. Mount File & Media Routes (dual-mount hỗ trợ cả prefix /api/v1/files và /files)
+// SEC-09: Mount requireGatewayOrigin để bảo vệ endpoints khỏi bypass API Gateway
 mediaApp.use(
   "/api/v1/files",
+  requireGatewayOrigin,
   rateLimitMiddleware,
   maintenanceGuard(),
   fileRoute,
 );
-mediaApp.use("/files", rateLimitMiddleware, maintenanceGuard(), fileRoute);
+mediaApp.use(
+  "/files",
+  requireGatewayOrigin,
+  rateLimitMiddleware,
+  maintenanceGuard(),
+  fileRoute,
+);
 
 // 5. Error handling middlewares
 mediaApp.use(notFoundMiddleware);

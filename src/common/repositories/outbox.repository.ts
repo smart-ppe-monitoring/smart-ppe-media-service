@@ -134,14 +134,18 @@ export class OutboxRepository {
     tx?: Prisma.TransactionClient,
   ): Promise<void> {
     const client = tx || this.db;
-    await client.outboxEvent.update({
-      where: { id },
-      data: {
-        status: OUTBOX_STATUS.PUBLISHED,
-        publishedAt: new Date(),
-        lastError: null,
-      },
-    });
+    try {
+      await client.outboxEvent.update({
+        where: { id },
+        data: {
+          status: OUTBOX_STATUS.PUBLISHED,
+          publishedAt: new Date(),
+          lastError: null,
+        },
+      });
+    } catch {
+      // Safe fallback if record does not exist or has already been pruned
+    }
   }
 
   /**
@@ -154,25 +158,31 @@ export class OutboxRepository {
     tx?: Prisma.TransactionClient,
   ): Promise<void> {
     const client = tx || this.db;
-    const existing = await client.outboxEvent.findUnique({
-      where: { id },
-      select: { attempts: true },
-    });
+    try {
+      // SEC-64: Atomic increment avoids read-modify-write lost update race under concurrency
+      const updated = await client.outboxEvent.update({
+        where: { id },
+        data: {
+          attempts: { increment: 1 },
+          lastError: errorMessage,
+        },
+        select: { attempts: true },
+      });
 
-    const nextAttempts = (existing?.attempts ?? 0) + 1;
-    const nextStatus: OutboxStatus =
-      nextAttempts >= maxAttempts
-        ? OUTBOX_STATUS.FAILED
-        : OUTBOX_STATUS.PENDING;
+      const nextStatus: OutboxStatus =
+        updated.attempts >= maxAttempts
+          ? OUTBOX_STATUS.FAILED
+          : OUTBOX_STATUS.PENDING;
 
-    await client.outboxEvent.update({
-      where: { id },
-      data: {
-        status: nextStatus,
-        attempts: nextAttempts,
-        lastError: errorMessage,
-      },
-    });
+      await client.outboxEvent.update({
+        where: { id },
+        data: {
+          status: nextStatus,
+        },
+      });
+    } catch {
+      // Safe fallback if record does not exist or has already been pruned
+    }
   }
 
   /**

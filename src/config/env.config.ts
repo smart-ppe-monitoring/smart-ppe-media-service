@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 
 const envSchema = z
@@ -8,15 +10,9 @@ const envSchema = z
       .enum(["development", "production", "test"])
       .default("development"),
     PORT: z.coerce.number().int().positive().default(8890),
+    SERVICE_NAME: z.string().default("smart-ppe-media-service"),
 
-    // ── Database (Database-per-Service Architecture) ─────────────────────────
-    IDENTITY_DATABASE_URL: z.string().optional(),
-    // Các service DB URLs — optional vì không phải service nào cũng active đồng thời
-    SITE_DATABASE_URL: z.string().optional(),
-    CAMERA_DATABASE_URL: z.string().optional(),
-    INCIDENT_DATABASE_URL: z.string().optional(),
-    NOTIFICATION_DATABASE_URL: z.string().optional(),
-    REPORTING_DATABASE_URL: z.string().optional(),
+    // ── Database (Database-per-Service Architecture: SEC-33) ─────────────────
     MEDIA_DATABASE_URL: z
       .string()
       .min(1, "MEDIA_DATABASE_URL is required")
@@ -65,7 +61,7 @@ const envSchema = z
     // ── Redis ─────────────────────────────────────────────────────────────────
     REDIS_URL: z.string().default(""),
     REDIS_HOST: z.string().default("localhost"),
-    REDIS_PORT: z.coerce.number().int().positive().default(6381),
+    REDIS_PORT: z.coerce.number().int().positive().default(6379),
     REDIS_PASSWORD: z.string().default(""),
     REDIS_ENABLED: z.string().default("true"),
 
@@ -78,6 +74,17 @@ const envSchema = z
       .positive()
       .default(900000),
     AUTH_RATE_LIMIT_MAX_REQUESTS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(30),
+    // SEC-35: Granular rate limiting for heavy Sharp image processing endpoints
+    SHARP_RATE_LIMIT_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(60000),
+    SHARP_RATE_LIMIT_MAX_REQUESTS: z.coerce
       .number()
       .int()
       .positive()
@@ -102,6 +109,16 @@ const envSchema = z
     PPE_MINIO_ROOT_PASSWORD: z.string().default("minio_admin_secret"),
     PPE_MINIO_BUCKET_EVIDENCES: z.string().default("ppe-evidences"),
     PPE_MINIO_FORCE_PATH_STYLE: z.string().default("true"),
+
+    // ── Object Storage / S3 / MinIO Standard (SEC-21) ────────────────────────
+    S3_ENDPOINT: z.string().default(""),
+    S3_PORT: z.coerce.number().int().positive().optional(),
+    S3_USE_SSL: z.string().default("false"),
+    S3_ACCESS_KEY: z.string().default(""),
+    S3_SECRET_KEY: z.string().default(""),
+    S3_BUCKET: z.string().default(""),
+    S3_REGION: z.string().default("us-east-1"),
+    S3_FORCE_PATH_STYLE: z.string().default("true"),
 
     // ── Notification Service & Worker (Phase 5: Satellite Microservice) ──────
     NOTIFICATION_WORKER_ENABLED: z.string().default("true"),
@@ -269,19 +286,29 @@ const envSchema = z
   )
   .refine(
     (env) => {
+      // SEC-16: Là một satellite microservice, smart-ppe-media-service chỉ xác thực JWT offline
+      // bằng Public Key và không bao giờ ký token. Do đó, tuyệt đối không đòi hỏi JWT_PRIVATE_KEY
+      // trong môi trường production mà chỉ yêu cầu JWT_PUBLIC_KEY, keys/public.key.pem hoặc AUTH_JWKS_URL.
       if (env.NODE_ENV !== "production") return true;
       if (env.JWT_ALGORITHM === "RS256") {
-        return (
-          typeof env.JWT_PRIVATE_KEY === "string" &&
-          env.JWT_PRIVATE_KEY.trim().length > 0
-        );
+        const hasPublicKeyEnv =
+          typeof env.JWT_PUBLIC_KEY === "string" &&
+          env.JWT_PUBLIC_KEY.trim().length > 0;
+        const hasJwksUrl =
+          typeof env.AUTH_JWKS_URL === "string" &&
+          env.AUTH_JWKS_URL.trim().length > 0;
+        const hasPublicKeyFile =
+          fs.existsSync(path.resolve(process.cwd(), "keys", "public.key.pem")) ||
+          fs.existsSync(path.resolve(process.cwd(), "public.key.pem"));
+
+        return hasPublicKeyEnv || hasJwksUrl || hasPublicKeyFile;
       }
       return true;
     },
     {
       message:
-        "JWT_PRIVATE_KEY bắt buộc phải được cấu hình khi JWT_ALGORITHM=RS256 trong môi trường production (định dạng PEM, base64 hoặc đường dẫn file)",
-      path: ["JWT_PRIVATE_KEY"],
+        "JWT_PUBLIC_KEY, keys/public.key.pem hoặc AUTH_JWKS_URL bắt buộc phải được cấu hình khi JWT_ALGORITHM=RS256 trong môi trường production cho satellite service",
+      path: ["JWT_PUBLIC_KEY"],
     },
   )
   .refine(
@@ -315,29 +342,39 @@ if (!_parsed.success) {
 
 const _env = _parsed.data;
 
-/** Phân giải giá trị TRUST_PROXY sang kiểu mà Express chấp nhận */
-function parseTrustProxy(val: string): boolean | number | string | string[] {
-  if (val === "true") return true;
+/**
+ * Phân giải giá trị TRUST_PROXY sang kiểu mà Express chấp nhận (SEC-08).
+ * Khi TRUST_PROXY="true", chỉ tin cậy 1 hop proxy (Traefik Ingress Gateway) thay vì true (unlimited hops)
+ * để ngăn chặn kẻ tấn công tự tiêm IP giả mạo vào header X-Forwarded-For nhằm bypass rate limiting.
+ */
+export function parseTrustProxy(
+  val: string,
+): boolean | number | string | string[] {
+  if (val === "true") return 1;
   if (val === "false") return false;
   if (/^\d+$/.test(val)) return parseInt(val, 10);
   if (val.includes(",")) return val.split(",").map((s) => s.trim());
   return val;
 }
 
-/** Giải quyết encryption key theo thứ tự ưu tiên: ENCRYPTION_KEY > APP_SECRET. Tuyệt đối không fallback sang JWT_ACCESS_SECRET trong production */
-function resolveEncryptionKey(): string {
-  const key = _env.ENCRYPTION_KEY || _env.APP_SECRET;
+/** Giải quyết encryption key theo thứ tự ưu tiên: ENCRYPTION_KEY > APP_SECRET. Tuyệt đối không fallback sang JWT_ACCESS_SECRET trong production (SEC-27) */
+export function resolveEncryptionKey(
+  nodeEnv: string = process.env.NODE_ENV || _env.NODE_ENV,
+): string {
+  const key =
+    process.env.ENCRYPTION_KEY ||
+    _env.ENCRYPTION_KEY ||
+    process.env.APP_SECRET ||
+    _env.APP_SECRET;
   if (key && key.length >= 32) {
     return key;
   }
-  if (_env.NODE_ENV === "production") {
+  if (nodeEnv === "production") {
     throw new Error(
       "ENCRYPTION_KEY or APP_SECRET must be explicitly configured with at least 32 characters in production",
     );
   }
-  return (
-    key || _env.JWT_ACCESS_SECRET || "default_32_bytes_secret_key_aes256_gcm!!"
-  );
+  return key || "default_32_bytes_secret_key_aes256_gcm!!";
 }
 
 /** Phân giải cấu hình Redis: ưu tiên REDIS_URL (DSN) nếu có, fallback sang biến đơn */
@@ -373,16 +410,11 @@ function resolveRedisConfig() {
 
 export const envConfig = {
   nodeEnv: _env.NODE_ENV,
+  serviceName: _env.SERVICE_NAME,
   port: _env.PORT,
   database: {
     url: _env.MEDIA_DATABASE_URL,
     mediaUrl: _env.MEDIA_DATABASE_URL,
-    identityUrl: _env.IDENTITY_DATABASE_URL,
-    siteUrl: _env.SITE_DATABASE_URL,
-    cameraUrl: _env.CAMERA_DATABASE_URL,
-    incidentUrl: _env.INCIDENT_DATABASE_URL,
-    notificationUrl: _env.NOTIFICATION_DATABASE_URL,
-    reportingUrl: _env.REPORTING_DATABASE_URL,
   },
   jwt: {
     algorithm: _env.JWT_ALGORITHM,
@@ -463,6 +495,16 @@ export const envConfig = {
     bucketEvidences: _env.PPE_MINIO_BUCKET_EVIDENCES,
     forcePathStyle: _env.PPE_MINIO_FORCE_PATH_STYLE !== "false",
   },
+  s3: {
+    endpoint: _env.S3_ENDPOINT || _env.PPE_MINIO_ENDPOINT || "",
+    port: _env.S3_PORT,
+    useSsl: _env.S3_USE_SSL === "true",
+    accessKeyId: _env.S3_ACCESS_KEY || _env.PPE_MINIO_ROOT_USER || "",
+    secretAccessKey: _env.S3_SECRET_KEY || _env.PPE_MINIO_ROOT_PASSWORD || "",
+    bucket: _env.S3_BUCKET || _env.PPE_MINIO_BUCKET_EVIDENCES || "",
+    region: _env.S3_REGION || "us-east-1",
+    forcePathStyle: _env.S3_FORCE_PATH_STYLE !== "false",
+  },
 
 
   rateLimit: {
@@ -470,6 +512,8 @@ export const envConfig = {
     maxRequests: _env.RATE_LIMIT_MAX_REQUESTS,
     authWindowMs: _env.AUTH_RATE_LIMIT_WINDOW_MS,
     authMaxRequests: _env.AUTH_RATE_LIMIT_MAX_REQUESTS,
+    sharpWindowMs: _env.SHARP_RATE_LIMIT_WINDOW_MS,
+    sharpMaxRequests: _env.SHARP_RATE_LIMIT_MAX_REQUESTS,
   },
   encryption: {
     key: resolveEncryptionKey(),

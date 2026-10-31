@@ -49,10 +49,46 @@ interface CachedKey {
 const inMemoryKeyCache = new Map<string, CachedKey>();
 
 /**
+ * SEC-36: Negative cache (tombstone) cho các kid không tồn tại trên remote JWKS
+ * Key: kid, Value: expiresAt (thời điểm hết hạn cooldown)
+ */
+const negativeKeyCache = new Map<string, number>();
+const NEGATIVE_CACHE_TTL_MS = 30_000; // 30 giây cooldown cho kid không hợp lệ
+
+/**
+ * SEC-36: Giới hạn tần suất gọi remote JWKS (cooldown giữa các lần fetch toàn bộ keys)
+ */
+let lastJwksFetchTime = 0;
+const JWKS_FETCH_COOLDOWN_MS = 10_000; // Tối thiểu 10 giây giữa 2 lần fetch từ xa
+
+/**
+ * SEC-36: Single-flight in-flight promise deduplication
+ */
+let inflightJwksPromise: Promise<void> | null = null;
+
+/**
  * Xóa cache (phục vụ testing hoặc manual invalidation)
  */
 export function clearJwtPublicKeyCache(): void {
   inMemoryKeyCache.clear();
+  negativeKeyCache.clear();
+  lastJwksFetchTime = 0;
+  inflightJwksPromise = null;
+}
+
+function setNegativeCache(kid: string, ttlMs: number = NEGATIVE_CACHE_TTL_MS): void {
+  const MAX_NEGATIVE_ENTRIES = 500;
+  if (negativeKeyCache.size >= MAX_NEGATIVE_ENTRIES) {
+    const now = Date.now();
+    for (const [k, exp] of negativeKeyCache.entries()) {
+      if (exp <= now) negativeKeyCache.delete(k);
+    }
+    if (negativeKeyCache.size >= MAX_NEGATIVE_ENTRIES) {
+      const oldest = negativeKeyCache.keys().next().value;
+      if (oldest) negativeKeyCache.delete(oldest);
+    }
+  }
+  negativeKeyCache.set(kid, Date.now() + ttlMs);
 }
 
 interface AccessTokenClaims {
@@ -62,6 +98,7 @@ interface AccessTokenClaims {
   roleId?: string;
   purpose?: string;
   type?: string;
+  mustChangePassword?: boolean;
 }
 
 /**
@@ -85,13 +122,12 @@ function setCachedKey(kid: string, pem: string, expiresAt: number): void {
 }
 
 /**
- * Nạp Public Key từ JWKS Endpoint từ xa với timeout và caching
+ * Nạp toàn bộ Public Keys từ JWKS Endpoint từ xa với timeout và caching
  */
-async function fetchPublicKeyFromJwks(
+async function fetchAllKeysFromJwks(
   jwksUri: string,
-  kid?: string,
   cacheTtlMs: number = JWKS_CONSTANTS.DEFAULT_CACHE_TTL_MS,
-): Promise<string> {
+): Promise<void> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 5000);
 
@@ -100,6 +136,9 @@ async function fetchPublicKeyFromJwks(
       signal: controller.signal,
       headers: { Accept: "application/json" },
     });
+
+    // Cập nhật timestamp fetch ngay khi nhận response để kích hoạt cooldown
+    lastJwksFetchTime = Date.now();
 
     if (!response.ok) {
       throw new Error(
@@ -115,7 +154,6 @@ async function fetchPublicKeyFromJwks(
     }
 
     const now = Date.now();
-    let targetPem = "";
 
     // Lưu toàn bộ keys nhận được vào RAM cache
     for (const key of data.keys) {
@@ -123,27 +161,68 @@ async function fetchPublicKeyFromJwks(
       try {
         const pem = JwtKeyService.jwkToPem(key as any);
         setCachedKey(currentKid, pem, now + cacheTtlMs);
-
-        if (kid) {
-          if (currentKid === kid) {
-            targetPem = pem;
-          }
-        } else if (!targetPem) {
-          targetPem = pem;
-        }
+        negativeKeyCache.delete(currentKid);
       } catch {
         // Bỏ qua key không hợp lệ
       }
     }
-
-    if (!targetPem) {
-      throw new Error(`Không tìm thấy Public Key phù hợp với kid: '${kid}'`);
-    }
-
-    return targetPem;
+  } catch (err) {
+    // Ngay cả khi gặp lỗi mạng, thiết lập timestamp để ngăn chặn loop fetch liên tục
+    lastJwksFetchTime = Date.now();
+    throw err;
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Nạp Public Key từ JWKS Endpoint từ xa với single-flight deduplication, cooldown và negative caching (SEC-36)
+ */
+async function fetchPublicKeyFromJwks(
+  jwksUri: string,
+  kid?: string,
+  cacheTtlMs: number = JWKS_CONSTANTS.DEFAULT_CACHE_TTL_MS,
+): Promise<string> {
+  const targetKid = kid || JWKS_CONSTANTS.DEFAULT_KEY_ID;
+
+  // 1. Kiểm tra negative cache (tombstone)
+  const tombstoneUntil = negativeKeyCache.get(targetKid);
+  if (tombstoneUntil && tombstoneUntil > Date.now()) {
+    throw new Error(
+      `Public Key cho kid '${targetKid}' gần đây không tìm thấy (cooldown active)`,
+    );
+  }
+
+  // 2. Coalesce in-flight requests và kiểm tra cooldown
+  const now = Date.now();
+  const recentlyFetched = now - lastJwksFetchTime < JWKS_FETCH_COOLDOWN_MS;
+
+  if (!recentlyFetched) {
+    if (!inflightJwksPromise) {
+      inflightJwksPromise = fetchAllKeysFromJwks(jwksUri, cacheTtlMs).finally(
+        () => {
+          inflightJwksPromise = null;
+        },
+      );
+    }
+
+    try {
+      await inflightJwksPromise;
+    } catch (err) {
+      setNegativeCache(targetKid, 5000);
+      throw err;
+    }
+  }
+
+  // 3. Sau khi JWKS đã nạp (hoặc vừa nạp gần đây), kiểm tra inMemoryKeyCache
+  const cached = inMemoryKeyCache.get(targetKid);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.pem;
+  }
+
+  // 4. Nếu remote JWKS không có key này -> tombstone và ném lỗi
+  setNegativeCache(targetKid, NEGATIVE_CACHE_TTL_MS);
+  throw new Error(`Không tìm thấy Public Key phù hợp với kid: '${targetKid}'`);
 }
 
 /**
@@ -227,6 +306,18 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
     res: Response,
     next: NextFunction,
   ): Promise<void> => {
+    // SEC-10: Cấm truyền token xác thực qua query string (?token= hoặc ?ticket=) trên toàn bộ endpoints
+    // để triệt tiêu nguy cơ rò rỉ JWT qua access logs, reverse proxy và browser history (RFC 6750 Section 2.3 / CWE-598)
+    if (Boolean(req.query && (req.query.token || req.query.ticket))) {
+      return next(
+        new AppError(
+          "Không được phép truyền token xác thực qua query parameters để tránh rò rỉ qua access logs và browser history",
+          400,
+          ERROR_CODE.VALIDATION_ERROR,
+        ),
+      );
+    }
+
     const token = extractTokenFromRequest(req);
 
     if (!token) {
@@ -250,7 +341,7 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
 
         if (payload.purpose === JWT_PURPOSE.SSE_STREAM_TICKET) {
           req.user = {
-            id: payload.id,
+            id: (payload as any).sub || payload.id || (payload as any).userId,
             email: payload.email,
             role: payload.role as any,
             roleId: payload.roleId,
@@ -304,7 +395,13 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
         }) as AccessTokenClaims;
       } catch (verifyErr) {
         const jwksUri = options.jwksUri || jwtConfig.authJwksUrl;
-        if (kid && autoRefreshOnUnknownKid && jwksUri) {
+        // SEC-36: Chỉ refresh nếu có kid/jwksUri và cooldown đã qua, tránh double fetch lặp lại ngay lập tức
+        if (
+          kid &&
+          autoRefreshOnUnknownKid &&
+          jwksUri &&
+          Date.now() - lastJwksFetchTime >= JWKS_FETCH_COOLDOWN_MS
+        ) {
           try {
             inMemoryKeyCache.delete(kid);
             const refreshedKey = await fetchPublicKeyFromJwks(
@@ -338,9 +435,20 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
         );
       }
 
-      // 6. Gán context user cho microservice hiện tại
+      // SEC-07: Chặn token mang cờ mustChangePassword truy cập tài nguyên
+      if (payload.mustChangePassword === true) {
+        throw new AppError(
+          "Yêu cầu đổi mật khẩu trước khi truy cập tài nguyên hệ thống",
+          403,
+          ERROR_CODE.FORBIDDEN,
+        );
+      }
+
+      // 6. Gán context user cho microservice hiện tại (SEC-46: Tuân thủ RFC 7519 trích xuất sub claim)
+      const resolvedUserId =
+        (payload as any).sub || payload.id || (payload as any).userId;
       req.user = {
-        id: payload.id,
+        id: resolvedUserId,
         email: payload.email,
         role: payload.role as any,
         roleId: payload.roleId,

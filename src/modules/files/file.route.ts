@@ -10,6 +10,7 @@ import {
 } from "../../middlewares/permission.middleware";
 import { validate } from "../../middlewares/validate.middleware";
 import { uploadImageMiddleware } from "../../middlewares/upload.middleware";
+import { sharpRateLimitMiddleware } from "../../middlewares/rate-limit.middleware";
 import { PERMISSIONS } from "../../common/constants/permission.constant";
 import {
   fileIdParamSchema,
@@ -17,6 +18,8 @@ import {
   confirmUploadSchema,
   listFilesSchema,
   imageTransformSchema,
+  imageTransformQuerySchema,
+  imageTransformBodySchema,
   directImageUploadSchema,
   cleanupFilesSchema,
 } from "./file.validation";
@@ -33,9 +36,10 @@ router.post(
   controller.requestUploadUrl,
 );
 
-// 2. Tải lên và tối ưu hóa ảnh trực tiếp bằng Sharp (WebP, avatar, resize)
+// 2. Tải lên và tối ưu hóa ảnh trực tiếp bằng Sharp (WebP, avatar, resize - SEC-35: sharpRateLimitMiddleware)
 router.post(
   "/upload-image",
+  sharpRateLimitMiddleware,
   verifyJwtLocally,
   requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
   uploadImageMiddleware.single("image"),
@@ -52,10 +56,11 @@ router.post(
   controller.cleanupOrphanFiles,
 );
 
-// 4. Xác nhận đã upload file lên S3/R2 thành công
+// 4. Xác nhận đã upload file lên S3/R2 thành công (yêu cầu quyền FILE_UPLOAD hoặc FILE_MANAGE - SEC-28)
 router.post(
   "/:id/confirm",
   verifyJwtLocally,
+  requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
   validate(fileIdParamSchema, "params"),
   validate(confirmUploadSchema),
   controller.confirmUpload,
@@ -77,16 +82,28 @@ router.get(
   controller.findById,
 );
 
-// 7. Biến đổi ảnh (resize, crop, convert format) qua Sharp
+// 7. Biến đổi ảnh on-the-fly qua Sharp (Read-only GET - RFC 7231 Safe & Idempotent - SEC-35: sharpRateLimitMiddleware)
 router.get(
   "/:id/transform",
+  sharpRateLimitMiddleware,
   optionalVerifyJwtLocally,
   validate(fileIdParamSchema, "params"),
-  validate(imageTransformSchema, "query"),
+  validate(imageTransformQuerySchema, "query"),
   controller.transformImage,
 );
 
-// 8. Xin presigned download URL (dành cho file private)
+// 8. Biến đổi ảnh và lưu thành bản ghi tệp mới (Mutation POST - SEC-23: Yêu cầu JWT & Quyền FILE_UPLOAD - SEC-35: sharpRateLimitMiddleware)
+router.post(
+  "/:id/transform",
+  sharpRateLimitMiddleware,
+  verifyJwtLocally,
+  requireAnyPermission(PERMISSIONS.FILE_UPLOAD, PERMISSIONS.FILE_MANAGE),
+  validate(fileIdParamSchema, "params"),
+  validate(imageTransformBodySchema, "body"),
+  controller.transformImage,
+);
+
+// 9. Xin presigned download URL (dành cho file private)
 router.get(
   "/:id/download-url",
   optionalVerifyJwtLocally,
@@ -94,7 +111,7 @@ router.get(
   controller.getDownloadUrl,
 );
 
-// 9. Direct download (302 redirect trực tiếp tới signed URL)
+// 10. Direct download (302 redirect trực tiếp tới signed URL)
 router.get(
   "/:id/download",
   optionalVerifyJwtLocally,
@@ -102,7 +119,7 @@ router.get(
   controller.downloadDirect,
 );
 
-// 10. Xóa tệp (yêu cầu đăng nhập và có quyền FILE_DELETE hoặc FILE_MANAGE)
+// 11. Xóa tệp (yêu cầu đăng nhập và có quyền FILE_DELETE hoặc FILE_MANAGE)
 router.delete(
   "/:id",
   verifyJwtLocally,

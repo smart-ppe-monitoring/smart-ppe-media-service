@@ -26,6 +26,7 @@ import {
 export interface PublishEventOptions {
   aggregateId?: string | null;
   traceId?: string;
+  source?: string;
   tx?: Prisma.TransactionClient;
   useOutbox?: boolean;
 }
@@ -43,6 +44,25 @@ const isTestEnv =
   process.env.NODE_ENV === "test" ||
   process.argv.some((arg) => arg.includes("test")) ||
   process.env.npm_lifecycle_event === "test";
+
+/**
+ * Danh sách các trường dữ liệu nhạy cảm cần mã hóa AES-256-GCM trong Outbox (SEC-47).
+ * Bao gồm cả token xác thực người dùng và các credential, presigned URL của Media/S3.
+ */
+export const SENSITIVE_OUTBOX_FIELDS = [
+  "verifyToken",
+  "resetToken",
+  "deactivationToken",
+  "password",
+  "presignedUrl",
+  "uploadUrl",
+  "downloadUrl",
+  "accessKey",
+  "secretAccessKey",
+  "sessionToken",
+  "token",
+  "apiKey",
+] as const;
 
 export class EventBusService {
   private queue?: Queue<EventEnvelope>;
@@ -65,15 +85,27 @@ export class EventBusService {
     envelope: EventEnvelope;
     attempts: number;
   }> = [];
+  private activeRetryTimers = new Set<NodeJS.Timeout>();
   private outboxRepo: OutboxRepository;
   private isProcessingInMemory = false;
 
-  constructor(outboxRepo?: OutboxRepository) {
+  constructor(outboxRepo?: OutboxRepository, redisConnection?: IORedis) {
     this.outboxRepo = outboxRepo || outboxRepository;
 
-    if (!isTestEnv && envConfig.redis.enabled) {
+    if (redisConnection) {
+      this.redisConnection = redisConnection;
+      this.isRedisAvailable = true;
+    } else if (!isTestEnv && envConfig.redis.enabled) {
       this.initRedis();
     }
+  }
+
+  public setRedisConnectionForTesting(
+    client: IORedis | any | undefined,
+    isAvailable = true,
+  ): void {
+    this.redisConnection = client;
+    this.isRedisAvailable = Boolean(client && isAvailable);
   }
 
   private initRedis(): void {
@@ -175,7 +207,8 @@ export class EventBusService {
       aggregateId: options?.aggregateId ?? null,
       timestamp: Date.now(),
       traceId,
-      source: "template-be-core",
+      // SEC-51: Dynamic service name resolution to prevent hardcoded boilerplate source
+      source: options?.source || envConfig.serviceName || "smart-ppe-media-service",
     };
 
     const useOutbox = options?.useOutbox ?? true;
@@ -204,9 +237,13 @@ export class EventBusService {
           return envelope;
         }
 
-        // Nếu không nằm trong transaction mở, tiếp tục dispatch và mark published ngay
-        await this.enqueueEnvelope(envelope);
-        await this.outboxRepo.markPublished(outboxRecord.id).catch(() => {});
+        // SEC-58: Khi enqueue vào queue broker ngoại vi (BullMQ/Redis), bản ghi có thể đánh dấu PUBLISHED.
+        // Tuy nhiên, khi rơi vào fallback in-memory queue cục bộ, KHÔNG đánh dấu published ngay tại đây
+        // mà chờ subscriber thực thi xong trong triggerInMemoryProcessing() để chống mất event khi process crash.
+        const destination = await this.enqueueEnvelope(envelope);
+        if (destination === "queue") {
+          await this.outboxRepo.markPublished(outboxRecord.id).catch(() => {});
+        }
         return envelope;
       } catch (err: any) {
         if (options?.tx) {
@@ -227,7 +264,9 @@ export class EventBusService {
   /**
    * Đẩy envelope vào hàng đợi BullMQ hoặc in-memory
    */
-  private async enqueueEnvelope(envelope: EventEnvelope): Promise<void> {
+  private async enqueueEnvelope(
+    envelope: EventEnvelope,
+  ): Promise<"queue" | "in_memory"> {
     if (this.isRedisAvailable) {
       try {
         if (
@@ -238,14 +277,14 @@ export class EventBusService {
           await this.notificationQueue.add(envelope.name, envelope, {
             jobId: envelope.id,
           });
-          return;
+          return "queue";
         }
 
         if (this.queue) {
           await this.queue.add(envelope.name, envelope, {
             jobId: envelope.id,
           });
-          return;
+          return "queue";
         }
       } catch {
         // Fallback in-memory
@@ -260,6 +299,7 @@ export class EventBusService {
     });
 
     this.triggerInMemoryProcessing();
+    return "in_memory";
   }
 
   private triggerInMemoryProcessing(): void {
@@ -274,6 +314,11 @@ export class EventBusService {
 
           try {
             await this.dispatchDirectly(item.envelope);
+            // SEC-58: Đánh dấu outbox event là PUBLISHED chỉ sau khi các subscriber
+            // đã hoàn tất xử lý thành công qua dispatchDirectly().
+            await this.outboxRepo
+              .markPublished(item.envelope.id)
+              .catch(() => {});
           } catch (err: any) {
             item.attempts++;
             if (item.attempts >= EVENT_BUS_CONSTANTS.DEFAULT_MAX_ATTEMPTS) {
@@ -282,12 +327,31 @@ export class EventBusService {
                 err?.message || String(err),
                 item.attempts,
               );
+              await this.outboxRepo
+                .markFailed(
+                  item.envelope.id,
+                  err?.message || String(err),
+                  item.attempts,
+                )
+                .catch(() => {});
             } else {
-              // Retry with exponential backoff delay
-              await new Promise((r) =>
-                setTimeout(r, Math.min(50 * Math.pow(2, item.attempts), 500)),
+              // SEC-56: Tách rời (decouple) backoff retry khỏi vòng lặp tuần tự (serial while-loop)
+              // nhằm ngăn ngừa Head-of-Line Blocking DoS.
+              // Thay vì await sleep đồng bộ chặn đứng toàn bộ các sự kiện lành mạnh phía sau,
+              // lên lịch re-enqueue qua setTimeout bất đồng bộ và để vòng lặp tiếp tục xử lý các event tiếp theo ngay lập tức.
+              const backoffDelay = Math.min(
+                50 * Math.pow(2, item.attempts),
+                500,
               );
-              this.inMemoryQueue.push(item);
+              const retryTimer = setTimeout(() => {
+                this.activeRetryTimers.delete(retryTimer);
+                this.inMemoryQueue.push(item);
+                this.triggerInMemoryProcessing();
+              }, backoffDelay);
+              if (typeof retryTimer.unref === "function") {
+                retryTimer.unref();
+              }
+              this.activeRetryTimers.add(retryTimer);
             }
           }
         }
@@ -301,8 +365,8 @@ export class EventBusService {
    * Xử lý sự kiện trực tiếp tới các consumers kèm bảo vệ Idempotent Consumer
    */
   public async dispatchDirectly(envelope: EventEnvelope): Promise<void> {
-    // 1. Kiểm tra tính Idempotent: Nếu eventId đã được xử lý trong vòng 24h thì bỏ qua
-    if (this.isEventAlreadyProcessed(envelope.id)) {
+    // 1. Kiểm tra tính Idempotent: Nếu eventId đã được xử lý trong vòng 24h thì bỏ qua (SEC-50)
+    if (await this.isEventAlreadyProcessed(envelope.id)) {
       console.log(
         `[EventBus] ⏭️ Duplicate event ${envelope.id} skipped (Idempotent protection)`,
       );
@@ -312,7 +376,7 @@ export class EventBusService {
     const handlers = this.handlers.get(envelope.name);
     if (!handlers || handlers.size === 0) {
       // Không có consumer đăng ký cho topic này
-      this.markEventProcessed(envelope.id);
+      await this.markEventProcessed(envelope.id);
       return;
     }
 
@@ -334,13 +398,27 @@ export class EventBusService {
     );
 
     // 3. Đánh dấu đã xử lý thành công
-    this.markEventProcessed(envelope.id);
+    await this.markEventProcessed(envelope.id);
   }
 
   /**
    * Kiểm tra xem sự kiện đã từng được xử lý chưa (Idempotency Check)
+   * Kết hợp Redis phân tán (multi-pod / replicas) và In-Memory cache fallback (SEC-50).
    */
-  public isEventAlreadyProcessed(eventId: string): boolean {
+  public async isEventAlreadyProcessed(eventId: string): Promise<boolean> {
+    // 1. Kiểm tra Redis phân tán cho cụm multi-pod / replicas (SEC-50)
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const cached = await this.redisConnection.get(
+          `idempotency:event:${eventId}`,
+        );
+        if (cached) return true;
+      } catch {
+        // Fallback sang in-memory nếu Redis trục trặc
+      }
+    }
+
+    // 2. Fallback sang In-Memory Cache
     const expiresAt = this.processedEventIds.get(eventId);
     if (!expiresAt) return false;
     if (Date.now() > expiresAt) {
@@ -350,8 +428,30 @@ export class EventBusService {
     return true;
   }
 
-  public markEventProcessed(eventId: string): void {
-    // Giới hạn bộ nhớ đệm tối đa 10.000 events
+  /**
+   * Đánh dấu sự kiện đã được xử lý (Idempotency Record - SEC-50)
+   * Sử dụng SET EX trên Redis phân tán và đồng bộ vào bộ nhớ đệm cục bộ.
+   */
+  public async markEventProcessed(eventId: string): Promise<void> {
+    // 1. Ghi nhận vào Redis phân tán với TTL 24 giờ (SEC-50)
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const ttlSec = Math.max(
+          1,
+          Math.floor(EVENT_BUS_CONSTANTS.IDEMPOTENCY_TTL_MS / 1000),
+        );
+        await this.redisConnection.set(
+          `idempotency:event:${eventId}`,
+          "1",
+          "EX",
+          ttlSec,
+        );
+      } catch {
+        // Fallback
+      }
+    }
+
+    // 2. Ghi nhận vào In-Memory Cache
     if (this.processedEventIds.size >= 10000) {
       const now = Date.now();
       for (const [k, exp] of this.processedEventIds.entries()) {
@@ -367,6 +467,41 @@ export class EventBusService {
       eventId,
       Date.now() + EVENT_BUS_CONSTANTS.IDEMPOTENCY_TTL_MS,
     );
+  }
+
+  /**
+   * Nguyên tử hóa kiểm tra và ghi nhận sự kiện qua Redis SET NX EX (Atomic Idempotent Claim - SEC-50).
+   * Trả về true nếu sự kiện là mới (khóa thành công), false nếu sự kiện đã tồn tại (duplicate).
+   */
+  public async tryAcquireEventLock(
+    eventId: string,
+    ttlMs: number = EVENT_BUS_CONSTANTS.IDEMPOTENCY_TTL_MS,
+  ): Promise<boolean> {
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const ttlSec = Math.max(1, Math.floor(ttlMs / 1000));
+        const res = await this.redisConnection.set(
+          `idempotency:event:${eventId}`,
+          "1",
+          "EX",
+          ttlSec,
+          "NX",
+        );
+        if (res === "OK") {
+          this.processedEventIds.set(eventId, Date.now() + ttlMs);
+          return true;
+        }
+        return false;
+      } catch {
+        // Fallback sang in-memory
+      }
+    }
+
+    if (await this.isEventAlreadyProcessed(eventId)) {
+      return false;
+    }
+    await this.markEventProcessed(eventId);
+    return true;
   }
 
   /**
@@ -438,7 +573,8 @@ export class EventBusService {
               (decryptedPayload as any)?._traceId ||
               (decryptedPayload as any)?.traceId ||
               record.id,
-            source: "template-be-outbox-relay",
+            // SEC-51: Dynamic service name resolution in outbox relay envelope
+            source: `${envConfig.serviceName || "smart-ppe-media-service"}-outbox-relay`,
           };
 
           // Nếu tiến trình hiện tại có handler cho sự kiện này -> dispatch trực tiếp
@@ -472,37 +608,24 @@ export class EventBusService {
   }
 
   /**
-   * Mã hóa các trường dữ liệu nhạy cảm (verifyToken, resetToken) trong payload
-   * trước khi lưu vào bảng outbox_events nhằm chống rò rỉ token plain-text.
+   * Mã hóa các trường dữ liệu nhạy cảm (tokens, keys, presigned URLs - SEC-47) trong payload
+   * trước khi lưu vào bảng outbox_events nhằm chống rò rỉ plain-text trong CSDL.
    */
   public encryptSensitivePayloadFields<T>(payload: T): T {
     if (!payload || typeof payload !== "object") return payload;
     const clone = { ...(payload as any) };
 
-    if ("verifyToken" in clone && typeof clone.verifyToken === "string") {
-      try {
-        clone.verifyToken = `enc:${encryptSecret(clone.verifyToken)}`;
-      } catch {
-        // Giữ nguyên nếu chưa có master key trong môi trường test
-      }
-    }
-
-    if ("resetToken" in clone && typeof clone.resetToken === "string") {
-      try {
-        clone.resetToken = `enc:${encryptSecret(clone.resetToken)}`;
-      } catch {
-        // Giữ nguyên nếu chưa có master key trong môi trường test
-      }
-    }
-
-    if (
-      "deactivationToken" in clone &&
-      typeof clone.deactivationToken === "string"
-    ) {
-      try {
-        clone.deactivationToken = `enc:${encryptSecret(clone.deactivationToken)}`;
-      } catch {
-        // Giữ nguyên nếu chưa có master key trong môi trường test
+    for (const field of SENSITIVE_OUTBOX_FIELDS) {
+      if (
+        field in clone &&
+        typeof clone[field] === "string" &&
+        !clone[field].startsWith("enc:")
+      ) {
+        try {
+          clone[field] = `enc:${encryptSecret(clone[field])}`;
+        } catch {
+          // Giữ nguyên nếu chưa có master key trong môi trường test
+        }
       }
     }
 
@@ -516,41 +639,17 @@ export class EventBusService {
     if (!payload || typeof payload !== "object") return payload;
     const clone = { ...(payload as any) };
 
-    if (
-      "verifyToken" in clone &&
-      typeof clone.verifyToken === "string" &&
-      clone.verifyToken.startsWith("enc:")
-    ) {
-      try {
-        clone.verifyToken = decryptSecret(clone.verifyToken.slice(4));
-      } catch {
-        // Giữ nguyên nếu giải mã thất bại
-      }
-    }
-
-    if (
-      "resetToken" in clone &&
-      typeof clone.resetToken === "string" &&
-      clone.resetToken.startsWith("enc:")
-    ) {
-      try {
-        clone.resetToken = decryptSecret(clone.resetToken.slice(4));
-      } catch {
-        // Giữ nguyên nếu giải mã thất bại
-      }
-    }
-
-    if (
-      "deactivationToken" in clone &&
-      typeof clone.deactivationToken === "string" &&
-      clone.deactivationToken.startsWith("enc:")
-    ) {
-      try {
-        clone.deactivationToken = decryptSecret(
-          clone.deactivationToken.slice(4),
-        );
-      } catch {
-        // Giữ nguyên nếu giải mã thất bại
+    for (const field of SENSITIVE_OUTBOX_FIELDS) {
+      if (
+        field in clone &&
+        typeof clone[field] === "string" &&
+        clone[field].startsWith("enc:")
+      ) {
+        try {
+          clone[field] = decryptSecret(clone[field].slice(4));
+        } catch {
+          // Giữ nguyên nếu giải mã thất bại
+        }
       }
     }
 
@@ -595,8 +694,18 @@ export class EventBusService {
     this.dlqEvents = [];
   }
 
-  public clearProcessedCache(): void {
+  public async clearProcessedCache(): Promise<void> {
     this.processedEventIds.clear();
+    if (this.isRedisAvailable && this.redisConnection) {
+      try {
+        const keys = await this.redisConnection.keys("idempotency:event:*");
+        if (keys && keys.length > 0) {
+          await this.redisConnection.del(...keys);
+        }
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   public getSubscriberCount(eventName: string): number {
@@ -605,6 +714,10 @@ export class EventBusService {
 
   public async close(): Promise<void> {
     this.handlers.clear();
+    for (const timer of this.activeRetryTimers) {
+      clearTimeout(timer);
+    }
+    this.activeRetryTimers.clear();
     this.inMemoryQueue = [];
     if (this.queue) {
       await this.queue.close().catch(() => {});

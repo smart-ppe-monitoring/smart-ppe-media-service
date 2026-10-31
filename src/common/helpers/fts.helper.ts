@@ -17,6 +17,15 @@ export function sanitizeFtsInput(input: string): string {
     .trim();
 }
 
+/**
+ * Thoát các ký tự đại diện đặc biệt (%, _, \) trong toán tử SQL LIKE
+ * SEC-54: Chống Wildcard Injection trong các truy vấn SQL LIKE lọc mimeType hoặc tiền tố.
+ */
+export function escapeSqlLike(input: string): string {
+  if (!input) return "";
+  return input.replace(/([\\%_])/g, "\\$1");
+}
+
 export type TsQueryMode = "prefix" | "exact" | "phrase" | "or";
 
 /**

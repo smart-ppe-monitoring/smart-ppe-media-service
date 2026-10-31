@@ -18,7 +18,13 @@ let _mediaPrisma: MediaPrismaClient | null = null;
 
 export function getMediaPrisma(): MediaPrismaClient {
   if (!_mediaPrisma) {
+    // SEC-34: Bind Prisma client constructor to dynamic database URL resolved by envConfig
     _mediaPrisma = new MediaPrismaClient({
+      datasources: {
+        db: {
+          url: envConfig.database.url,
+        },
+      },
       log:
         envConfig.nodeEnv === "development"
           ? ["query", "error", "warn"]
@@ -31,6 +37,10 @@ export function getMediaPrisma(): MediaPrismaClient {
 export const mediaPrisma = new Proxy({} as MediaPrismaClient, {
   get(_target, prop) {
     return (getMediaPrisma() as any)[prop];
+  },
+  set(_target, prop, value) {
+    (getMediaPrisma() as any)[prop] = value;
+    return true;
   },
 });
 
