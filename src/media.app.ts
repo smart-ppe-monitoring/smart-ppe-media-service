@@ -9,7 +9,10 @@ import {
 } from "./middlewares/error.middleware";
 import fileRoute from "./modules/files/file.route";
 import { rateLimitMiddleware } from "./middlewares/rate-limit.middleware";
-import { requestIdMiddleware } from "./middlewares/request-id.middleware";
+import {
+  requestIdMiddleware,
+  requireGatewayOrigin,
+} from "./middlewares/request-id.middleware";
 import { maintenanceGuard } from "./middlewares/maintenance.middleware";
 import { envConfig } from "./config/env.config";
 import { buildOpenApiSpec } from "./config/openapi/openapi.registry";
@@ -105,13 +108,21 @@ if (envConfig.nodeEnv !== "production") {
 }
 
 // 4. Mount File & Media Routes (dual-mount hỗ trợ cả prefix /api/v1/files và /files)
+// SEC-09: Mount requireGatewayOrigin để bảo vệ endpoints khỏi bypass API Gateway
 mediaApp.use(
   "/api/v1/files",
+  requireGatewayOrigin,
   rateLimitMiddleware,
   maintenanceGuard(),
   fileRoute,
 );
-mediaApp.use("/files", rateLimitMiddleware, maintenanceGuard(), fileRoute);
+mediaApp.use(
+  "/files",
+  requireGatewayOrigin,
+  rateLimitMiddleware,
+  maintenanceGuard(),
+  fileRoute,
+);
 
 // 5. Error handling middlewares
 mediaApp.use(notFoundMiddleware);

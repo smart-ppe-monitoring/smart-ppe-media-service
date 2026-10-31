@@ -5,15 +5,33 @@ import fs from "node:fs";
 import path from "node:path";
 import jwt from "jsonwebtoken";
 import { FileService } from "../src/modules/files/file.service";
-import { createVerifyJwtLocally } from "../src/middlewares/verify-jwt-locally.middleware";
-import { authMiddleware } from "../src/middlewares/auth.middleware";
+import {
+  createVerifyJwtLocally,
+} from "../src/middlewares/verify-jwt-locally.middleware";
+import {
+  authMiddleware,
+  extractTokenFromRequest,
+} from "../src/middlewares/auth.middleware";
+import {
+  createRequireGatewayOrigin,
+  requireGatewayOrigin,
+} from "../src/middlewares/request-id.middleware";
 import { parseTrustProxy } from "../src/config/env.config";
 import { jwtKeyService } from "../src/common/services/jwt-key.service";
 import { AppError } from "../src/common/errors/app-error";
 import { ERROR_CODE } from "../src/common/errors/error-code";
 import { PERMISSIONS } from "../src/common/constants/permission.constant";
+import { MEDIA_LIMITS } from "../src/common/constants/media.constant";
+import { uploadImageMiddleware } from "../src/middlewares/upload.middleware";
+import {
+  startOutboxRelay,
+  stopOutboxRelay,
+  handleMediaShutdown,
+  resetShutdownStateForTesting,
+} from "../src/server";
+import { eventBus } from "../src/common/services/event-bus.service";
 
-describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-08)", () => {
+describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-12)", () => {
   let rsaPrivateKey: string;
   let rsaPublicKey: string;
 
@@ -292,6 +310,207 @@ describe("P1 Security Vulnerabilities Patch Verification (SEC-05 - SEC-08)", () 
     test("parses comma-separated list of trusted subnets", () => {
       const result = parseTrustProxy("127.0.0.1, 10.0.0.0/8");
       assert.deepStrictEqual(result, ["127.0.0.1", "10.0.0.0/8"]);
+    });
+  });
+
+  describe("SEC-09: requireGatewayOrigin Middleware Enforces Trusted API Gateway Origin", () => {
+    test("rejects request when secret is configured and header x-gateway-secret is missing", () => {
+      const middleware = createRequireGatewayOrigin("super-secret-gateway-token");
+      const req: any = { headers: {} };
+      const res: any = {};
+      let caughtError: any = null;
+
+      middleware(req, res, (err: any) => {
+        caughtError = err;
+      });
+
+      assert.ok(caughtError instanceof AppError);
+      assert.strictEqual(caughtError.statusCode, 403);
+      assert.strictEqual(caughtError.code, ERROR_CODE.GATEWAY_REQUIRED);
+    });
+
+    test("rejects request when header x-gateway-secret does not match configured secret", () => {
+      const middleware = createRequireGatewayOrigin("super-secret-gateway-token");
+      const req: any = { headers: { "x-gateway-secret": "wrong-secret-token" } };
+      const res: any = {};
+      let caughtError: any = null;
+
+      middleware(req, res, (err: any) => {
+        caughtError = err;
+      });
+
+      assert.ok(caughtError instanceof AppError);
+      assert.strictEqual(caughtError.statusCode, 403);
+      assert.strictEqual(caughtError.code, ERROR_CODE.GATEWAY_REQUIRED);
+    });
+
+    test("allows request when header x-gateway-secret matches configured secret", () => {
+      const middleware = createRequireGatewayOrigin("super-secret-gateway-token");
+      const req: any = { headers: { "x-gateway-secret": "super-secret-gateway-token" } };
+      const res: any = {};
+      let nextCalled = false;
+
+      middleware(req, res, (err?: any) => {
+        assert.strictEqual(err, undefined);
+        nextCalled = true;
+      });
+
+      assert.strictEqual(nextCalled, true);
+    });
+
+    test("allows request when secret is empty (backward compatibility fallback)", () => {
+      const middleware = createRequireGatewayOrigin("");
+      const req: any = { headers: {} };
+      const res: any = {};
+      let nextCalled = false;
+
+      middleware(req, res, (err?: any) => {
+        assert.strictEqual(err, undefined);
+        nextCalled = true;
+      });
+
+      assert.strictEqual(nextCalled, true);
+    });
+  });
+
+  describe("SEC-10: Token Extraction Rejects Bearer JWTs in Query Parameters", () => {
+    test("extractTokenFromRequest ignores query parameters even on download paths", () => {
+      const req: any = {
+        baseUrl: "/api/v1/files",
+        path: "/123/download",
+        query: { token: "secret-jwt-in-query", ticket: "sse-ticket-in-query" },
+        headers: {},
+        cookies: {},
+      };
+
+      const extracted = extractTokenFromRequest(req);
+      assert.strictEqual(extracted, undefined, "Must not extract token from query parameters");
+    });
+
+    test("extractTokenFromRequest extracts token from Authorization Bearer header", () => {
+      const req: any = {
+        headers: { authorization: "Bearer valid-bearer-token" },
+        cookies: {},
+        query: {},
+      };
+
+      const extracted = extractTokenFromRequest(req);
+      assert.strictEqual(extracted, "valid-bearer-token");
+    });
+
+    test("extractTokenFromRequest extracts token from accessToken cookie", () => {
+      const req: any = {
+        headers: {},
+        cookies: { accessToken: "valid-cookie-token" },
+        query: {},
+      };
+
+      const extracted = extractTokenFromRequest(req);
+      assert.strictEqual(extracted, "valid-cookie-token");
+    });
+
+    test("authMiddleware rejects request with query parameter token with 400 VALIDATION_ERROR", async () => {
+      const req: any = {
+        query: { token: "leaked-token-in-query" },
+        headers: {},
+        cookies: {},
+      };
+      const res: any = {};
+      let caughtError: any = null;
+
+      await authMiddleware(req, res, (err: any) => {
+        caughtError = err;
+      });
+
+      assert.ok(caughtError instanceof AppError);
+      assert.strictEqual(caughtError.statusCode, 400);
+      assert.strictEqual(caughtError.code, ERROR_CODE.VALIDATION_ERROR);
+    });
+
+    test("verifyJwtLocally rejects request with query parameter ticket with 400 VALIDATION_ERROR", async () => {
+      const middleware = createVerifyJwtLocally();
+      const req: any = {
+        query: { ticket: "leaked-ticket-in-query" },
+        headers: {},
+        cookies: {},
+      };
+      const res: any = {};
+      let caughtError: any = null;
+
+      await middleware(req, res, (err: any) => {
+        caughtError = err;
+      });
+
+      assert.ok(caughtError instanceof AppError);
+      assert.strictEqual(caughtError.statusCode, 400);
+      assert.strictEqual(caughtError.code, ERROR_CODE.VALIDATION_ERROR);
+    });
+  });
+
+  describe("SEC-11: uploadImageMiddleware Enforces Direct RAM Memory Buffer Limits", () => {
+    test("verifies MEDIA_LIMITS.MAX_DIRECT_IMAGE_BYTES is 10MB (10485760 bytes)", () => {
+      assert.strictEqual(MEDIA_LIMITS.MAX_DIRECT_IMAGE_BYTES, 10 * 1024 * 1024);
+    });
+
+    test("verifies uploadImageMiddleware limits fileSize to MAX_DIRECT_IMAGE_BYTES and files to 1", () => {
+      const limits = (uploadImageMiddleware as any).limits;
+      assert.ok(limits, "Multer limits must be configured");
+      assert.strictEqual(limits.fileSize, 10 * 1024 * 1024, "fileSize limit must be 10MB");
+      assert.strictEqual(limits.files, 1, "files limit must be 1 file to prevent memory exhaustion");
+      assert.strictEqual(limits.fields, 10, "fields limit must be bounded");
+    });
+  });
+
+  describe("SEC-12: Transactional Outbox Relay Background Worker", () => {
+    test("startOutboxRelay starts recurring interval and invokes eventBus.relayPendingOutboxEvents", async () => {
+      let relayCalled = false;
+      const originalRelay = eventBus.relayPendingOutboxEvents;
+      try {
+        (eventBus as any).relayPendingOutboxEvents = async (batchSize: number) => {
+          relayCalled = true;
+          assert.strictEqual(batchSize, 25);
+          return 3;
+        };
+
+        const timer = startOutboxRelay(10, 25);
+        assert.ok(timer, "Timer must be returned");
+
+        // Wait for interval to fire
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.strictEqual(relayCalled, true, "relayPendingOutboxEvents should have been called");
+      } finally {
+        stopOutboxRelay();
+        (eventBus as any).relayPendingOutboxEvents = originalRelay;
+      }
+    });
+
+    test("stopOutboxRelay clears active timer", () => {
+      const timer = startOutboxRelay(1000);
+      assert.ok(timer);
+      stopOutboxRelay();
+      // Second stop should be a no-op without error
+      stopOutboxRelay();
+    });
+
+    test("handleMediaShutdown executes outbox drain before shutdown", async () => {
+      let drained = false;
+      const originalRelay = eventBus.relayPendingOutboxEvents;
+      const originalClose = eventBus.close;
+      try {
+        resetShutdownStateForTesting();
+        (eventBus as any).relayPendingOutboxEvents = async () => {
+          drained = true;
+          return 5;
+        };
+        (eventBus as any).close = async () => {};
+
+        await handleMediaShutdown("SIGTERM");
+        assert.strictEqual(drained, true, "Outbox drain should execute during shutdown");
+      } finally {
+        resetShutdownStateForTesting();
+        (eventBus as any).relayPendingOutboxEvents = originalRelay;
+        (eventBus as any).close = originalClose;
+      }
     });
   });
 });

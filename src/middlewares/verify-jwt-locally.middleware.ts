@@ -306,6 +306,18 @@ export function createVerifyJwtLocally(options: VerifyJwtLocallyOptions = {}) {
     res: Response,
     next: NextFunction,
   ): Promise<void> => {
+    // SEC-10: Cấm truyền token xác thực qua query string (?token= hoặc ?ticket=) trên toàn bộ endpoints
+    // để triệt tiêu nguy cơ rò rỉ JWT qua access logs, reverse proxy và browser history (RFC 6750 Section 2.3 / CWE-598)
+    if (Boolean(req.query && (req.query.token || req.query.ticket))) {
+      return next(
+        new AppError(
+          "Không được phép truyền token xác thực qua query parameters để tránh rò rỉ qua access logs và browser history",
+          400,
+          ERROR_CODE.VALIDATION_ERROR,
+        ),
+      );
+    }
+
     const token = extractTokenFromRequest(req);
 
     if (!token) {
