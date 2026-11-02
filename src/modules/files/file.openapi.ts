@@ -7,6 +7,10 @@ import {
   confirmUploadSchema,
   fileIdParamSchema,
   listFilesSchema,
+  imageTransformQuerySchema,
+  imageTransformBodySchema,
+  directImageUploadSchema,
+  cleanupFilesSchema,
 } from "./file.validation";
 import { z } from "zod";
 
@@ -264,6 +268,142 @@ export function registerFileOpenApi(): void {
       },
       403: { description: "Không có quyền xóa tệp của người khác" },
       404: { description: "Không tìm thấy tệp" },
+    },
+  });
+
+  // 8. POST /files/upload-image (Direct Multipart Upload)
+  openapiRegistry.registerPath({
+    method: "post",
+    path: "/files/upload-image",
+    tags: ["Files & Media Storage"],
+    summary: "Tải lên và tối ưu hóa hình ảnh trực tiếp qua Sharp (Multipart/form-data)",
+    security: [{ BearerAuth: [] }],
+    request: {
+      body: {
+        content: {
+          "multipart/form-data": {
+            schema: z.object({
+              image: z.string().openapi({ format: "binary", description: "File ảnh cần tải lên" }),
+              folder: z.string().optional().openapi({ example: "images" }),
+              isPublic: z.boolean().optional().openapi({ example: true }),
+            }),
+          },
+        },
+      },
+    },
+    responses: {
+      201: {
+        description: "Tải lên và tối ưu ảnh thành công",
+        content: {
+          "application/json": {
+            schema: z.object({
+              success: z.boolean().openapi({ example: true }),
+              message: z.string(),
+              data: FileItemSchema,
+            }),
+          },
+        },
+      },
+      400: { description: "File không hợp lệ hoặc vượt quá kích thước" },
+      401: { description: "Chưa xác thực" },
+    },
+  });
+
+  // 9. POST /files/cleanup
+  openapiRegistry.registerPath({
+    method: "post",
+    path: "/files/cleanup",
+    tags: ["Files & Media Storage"],
+    summary: "Quét dọn tệp tin rác / mồ côi (Yêu cầu FILE_MANAGE)",
+    security: [{ BearerAuth: [] }],
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: cleanupFilesSchema,
+          },
+        },
+      },
+    },
+    responses: {
+      200: {
+        description: "Quét dọn tệp tin rác hoàn tất",
+        content: {
+          "application/json": {
+            schema: z.object({
+              success: z.boolean().openapi({ example: true }),
+              message: z.string(),
+              data: z.object({
+                unconfirmedCleaned: z.number(),
+                softDeletedCleaned: z.number(),
+              }),
+            }),
+          },
+        },
+      },
+      401: { description: "Chưa xác thực" },
+      403: { description: "Không có quyền quản lý tệp tin" },
+    },
+  });
+
+  // 10. GET /files/{id}/transform
+  openapiRegistry.registerPath({
+    method: "get",
+    path: "/files/{id}/transform",
+    tags: ["Files & Media Storage"],
+    summary: "Biến đổi hình ảnh on-the-fly qua Sharp (Resize, Quality, Format WebP/JPEG)",
+    security: [{ BearerAuth: [] }],
+    request: {
+      params: fileIdParamSchema,
+      query: imageTransformQuerySchema,
+    },
+    responses: {
+      200: {
+        description: "Trả về dữ liệu nhị phân của hình ảnh đã biến đổi",
+        content: {
+          "image/webp": { schema: z.string().openapi({ format: "binary" }) },
+          "image/jpeg": { schema: z.string().openapi({ format: "binary" }) },
+          "image/png": { schema: z.string().openapi({ format: "binary" }) },
+        },
+      },
+      400: { description: "Tham số biến đổi ảnh không hợp lệ" },
+      404: { description: "Không tìm thấy tệp ảnh" },
+    },
+  });
+
+  // 11. POST /files/{id}/transform
+  openapiRegistry.registerPath({
+    method: "post",
+    path: "/files/{id}/transform",
+    tags: ["Files & Media Storage"],
+    summary: "Biến đổi hình ảnh và lưu thành bản ghi tệp mới trong hệ thống",
+    security: [{ BearerAuth: [] }],
+    request: {
+      params: fileIdParamSchema,
+      body: {
+        content: {
+          "application/json": {
+            schema: imageTransformBodySchema,
+          },
+        },
+      },
+    },
+    responses: {
+      201: {
+        description: "Tạo ảnh biến đổi mới thành công",
+        content: {
+          "application/json": {
+            schema: z.object({
+              success: z.boolean().openapi({ example: true }),
+              message: z.string(),
+              data: FileItemSchema,
+            }),
+          },
+        },
+      },
+      400: { description: "Tham số biến đổi ảnh không hợp lệ" },
+      401: { description: "Chưa xác thực" },
+      404: { description: "Không tìm thấy tệp ảnh gốc" },
     },
   });
 }
